@@ -440,12 +440,12 @@ class Asset(BaseAsset):
 
 
 app = App(
-    name="IMAP",
+    name="IMAP v2",
     app_type="email",
     logo="logo_splunk.svg",
     logo_dark="logo_splunk_dark.svg",
     product_vendor="Generic",
-    product_name="IMAP",
+    product_name="IMAP v2",
     publisher="Splunk",
     appid="69a0cc22-227b-4ecf-bf9d-443cabe870a0",
     fips_compliant=True,
