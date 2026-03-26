@@ -1,5 +1,5 @@
 [project]
-name = "imap"
+name = "imap_v2"
 version = "3.4.8"
 description = "This app supports email ingestion and various investigative actions over IMAP"
 license = "Copyright (c) 2016-2025 Splunk Inc."
