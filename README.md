@@ -1,9 +1,9 @@
-# IMAP
+# IMAP v2
 
 Publisher: Splunk <br>
 Connector Version: 3.4.8 <br>
 Product Vendor: Generic <br>
-Product Name: IMAP <br>
+Product Name: IMAP v2 <br>
 Minimum Product Version: 7.0.0
 
 This app supports email ingestion and various investigative actions over IMAP
@@ -300,7 +300,7 @@ Below are the ports used by IMAP library for the connection.
 
 ### Configuration variables
 
-This table lists the configuration variables required to operate IMAP. These variables are specified when configuring a IMAP asset in Splunk SOAR.
+This table lists the configuration variables required to operate IMAP v2. These variables are specified when configuring a IMAP v2 asset in Splunk SOAR.
 
 VARIABLE | REQUIRED | TYPE | DESCRIPTION
 -------- | -------- | ---- | -----------
