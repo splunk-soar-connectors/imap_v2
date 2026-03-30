@@ -398,7 +398,7 @@ class Asset(BaseAsset):
     max_emails: int = AssetField(
         required=True,
         description="Maximum emails to poll",
-        default=100,
+        default=50,
         category=FieldCategory.INGEST,
     )
     extract_attachments: bool = AssetField(
