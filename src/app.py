@@ -16,6 +16,7 @@ import email
 import hashlib
 import imaplib
 import json
+import shlex
 import socket
 import time
 from collections.abc import Generator, Iterator
@@ -29,7 +30,7 @@ from dateutil import tz
 from imapclient import imap_utf7
 from parse import parse
 from soar_sdk.abstract import SOARClient
-from soar_sdk.action_results import ActionOutput
+from soar_sdk.action_results import ActionOutput, OutputField
 from soar_sdk.app import App
 from soar_sdk.asset import AssetField, BaseAsset, FieldCategory
 from soar_sdk.auth import AuthorizationCodeFlow
@@ -39,6 +40,7 @@ from soar_sdk.auth.client import (
     TokenRefreshError,
 )
 from soar_sdk.auth.models import OAuthConfig
+from soar_sdk.exceptions import ActionFailure
 from soar_sdk.extras.email import EmailProcessor, ProcessEmailContext
 from soar_sdk.extras.email.email_data import EmailData, extract_email_data
 from soar_sdk.extras.email.utils import decode_uni_string
@@ -51,7 +53,13 @@ from soar_sdk.models.finding import (
     FindingEmail,
     FindingEmailReporter,
 )
-from soar_sdk.params import OnESPollParams, OnPollParams, Param, Params
+from soar_sdk.params import (
+    MakeRequestParams,
+    OnESPollParams,
+    OnPollParams,
+    Param,
+    Params,
+)
 from soar_sdk.shims.phantom.vault import PhantomVault
 from soar_sdk.webhooks.models import WebhookRequest, WebhookResponse
 
@@ -76,6 +84,23 @@ IMAP_APP_ID = "69a0cc22-227b-4ecf-bf9d-443cabe870a0"
 logger = getLogger()
 
 _EML_CONTENT_TYPES = {"message/rfc822"}
+_READ_ONLY_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
+_READ_ONLY_IMAP_COMMANDS = {
+    "CAPABILITY",
+    "EXAMINE",
+    "FETCH",
+    "ID",
+    "LIST",
+    "LSUB",
+    "NAMESPACE",
+    "NOOP",
+    "SEARCH",
+    "SORT",
+    "STATUS",
+    "THREAD",
+    "UID",
+}
+_READ_ONLY_UID_COMMANDS = {"FETCH", "SEARCH", "SORT", "THREAD"}
 
 
 def _is_forwarded_email_attachment(filename: str, content_type: str | None) -> bool:
@@ -194,6 +219,165 @@ def _build_finding_from_email(
         )
 
     return _build_direct_finding(email_id, raw_email, outer_data)
+
+
+def _decode_imap_response(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, tuple):
+        return [_decode_imap_response(item) for item in value]
+    if isinstance(value, list):
+        return [_decode_imap_response(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(_decode_imap_response(key)): _decode_imap_response(val)
+            for key, val in value.items()
+        }
+    return value
+
+
+def _split_imap_args(field_name: str, raw_value: str) -> list[str]:
+    try:
+        return shlex.split(raw_value, posix=False)
+    except ValueError as e:
+        raise ActionFailure(f"Invalid {field_name}: {e}") from e
+
+
+def _coerce_imap_arg(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+
+    arg = str(value)
+    if arg == "":
+        return '""'
+    return arg
+
+
+def _coerce_imap_literal(value) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return json.dumps(value).encode("utf-8")
+
+
+def _parse_make_request_args(
+    field_name: str, raw_value: str | None
+) -> list[str | None]:
+    if not raw_value:
+        return []
+
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return _split_imap_args(field_name, raw_value)
+
+    if isinstance(value, list):
+        return [_coerce_imap_arg(item) for item in value]
+
+    if isinstance(value, dict):
+        args = value.get("args")
+        if args is None:
+            if value:
+                raise ActionFailure(
+                    f"Invalid {field_name}: JSON object must contain an 'args' list"
+                )
+            return []
+        if not isinstance(args, list):
+            raise ActionFailure(f"Invalid {field_name}: args must be a JSON list")
+        return [_coerce_imap_arg(item) for item in args]
+
+    return [_coerce_imap_arg(value)]
+
+
+def _parse_make_request_body(
+    raw_value: str | None,
+) -> tuple[list[str | None], bytes | None]:
+    if not raw_value:
+        return [], None
+
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError:
+        return _split_imap_args("body", raw_value), None
+
+    if isinstance(value, dict):
+        if "args" not in value and "literal" not in value:
+            if value:
+                raise ActionFailure(
+                    "Invalid body: JSON object must contain an 'args' list or "
+                    "a 'literal' value"
+                )
+            return [], None
+        args = value.get("args")
+        if args is None:
+            args = []
+        if not isinstance(args, list):
+            raise ActionFailure("Invalid body: args must be a JSON list")
+        return [_coerce_imap_arg(item) for item in args], _coerce_imap_literal(
+            value.get("literal")
+        )
+
+    if isinstance(value, list):
+        return [_coerce_imap_arg(item) for item in value], None
+
+    return [_coerce_imap_arg(value)], None
+
+
+def _validate_unused_headers(raw_headers: str | None) -> None:
+    if not raw_headers:
+        return
+
+    try:
+        headers = json.loads(raw_headers)
+    except json.JSONDecodeError as e:
+        raise ActionFailure(f"Invalid JSON headers: {raw_headers}") from e
+
+    if headers:
+        raise ActionFailure("headers is not supported for IMAP make request")
+
+
+def _parse_make_request_endpoint(endpoint: str) -> tuple[str, list[str | None]]:
+    if endpoint.startswith(("http://", "https://")):
+        raise ActionFailure(
+            f"Invalid endpoint: {endpoint}. Use an IMAP command, not a URL."
+        )
+
+    parts = _split_imap_args("endpoint", endpoint)
+    if not parts:
+        raise ActionFailure("Invalid endpoint: IMAP command is required")
+
+    return parts[0].upper(), parts[1:]
+
+
+def _is_read_only_imap_command(command: str, args: list[str | None]) -> bool:
+    if command == "UID":
+        return bool(args) and str(args[0]).strip('"').upper() in _READ_ONLY_UID_COMMANDS
+    return command in _READ_ONLY_IMAP_COMMANDS
+
+
+def _imap_response_name(command: str, args: list[str | None]) -> str:
+    if command == "UID" and args:
+        uid_command = str(args[0]).strip('"').upper()
+        if uid_command in {"SEARCH", "SORT", "THREAD"}:
+            return uid_command
+        return "FETCH"
+    return command
+
+
+def _imap_status_code(status: str) -> int:
+    status = status.upper()
+    if status == "OK":
+        return 200
+    if status in {"NO", "BAD"}:
+        return 400
+    if status == "BYE":
+        return 503
+    return 500
 
 
 def _format_utc_date(date_str: str | None) -> str:
@@ -556,13 +740,15 @@ class ImapHelper:
         except TokenRefreshError as e:
             raise Exception(f"OAuth token refresh failed: {e}") from None
 
-    def _connect_to_server(self, first_try=True, access_token=None):
+    def _connect_to_server(
+        self, first_try=True, access_token=None, timeout=60, read_only=True
+    ):
         """Connect to the IMAP server"""
         is_oauth = self.asset.auth_type == "OAuth"
         use_ssl = self.asset.use_ssl
         server = self.asset.server
 
-        socket.setdefaulttimeout(60)
+        socket.setdefaulttimeout(timeout)
 
         try:
             if is_oauth or use_ssl:
@@ -602,7 +788,11 @@ class ImapHelper:
                     stored_token = oauth_client.get_stored_token()
                     if stored_token and stored_token.refresh_token:
                         oauth_client.refresh_token(stored_token.refresh_token)
-                        return self._connect_to_server(False)
+                        return self._connect_to_server(
+                            first_try=False,
+                            timeout=timeout,
+                            read_only=read_only,
+                        )
                 except Exception as refresh_error:
                     logger.error(f"OAuth token refresh failed: {refresh_error}")
             raise Exception(
@@ -626,7 +816,7 @@ class ImapHelper:
         self._folder_name = self.asset.folder
         try:
             result, _ = self._imap_conn.select(
-                f'"{imap_utf7.encode(self._folder_name).decode()}"', True
+                f'"{imap_utf7.encode(self._folder_name).decode()}"', read_only
             )
         except Exception as e:
             raise Exception(
@@ -933,6 +1123,131 @@ def on_es_poll(
         state["es_next_muid"] = int(email_id) + 1
 
         yield finding
+
+
+class ImapMakeRequestParams(MakeRequestParams):
+    http_method: str = Param(
+        description=(
+            "The HTTP method for Universal API compatibility. GET, HEAD, and "
+            "OPTIONS allow read-only IMAP commands; POST, PUT, PATCH, and "
+            "DELETE allow write-capable IMAP commands."
+        ),
+        required=True,
+        value_list=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+    )
+    endpoint: str = Param(
+        description=(
+            "IMAP command to run, with optional arguments. Examples: 'NOOP', "
+            "'CAPABILITY', 'LIST \"\" \"*\"', or 'UID SEARCH ALL'."
+        ),
+        required=True,
+    )
+    headers: str = Param(
+        description="Not used for IMAP requests. Providing headers will fail the action.",
+        required=False,
+    )
+    query_parameters: str = Param(
+        description=(
+            "Optional additional IMAP command arguments as a JSON list, an object "
+            "with an 'args' list, or a shell-style argument string."
+        ),
+        required=False,
+    )
+    body: str = Param(
+        description=(
+            "Optional additional IMAP command arguments as a JSON list, an object "
+            "with an 'args' list, a shell-style argument string, or an object with "
+            "a 'literal' value for IMAP literal data."
+        ),
+        required=False,
+    )
+    verify_ssl: bool | None = Param(
+        description=(
+            "Not used for IMAP requests; SSL usage is controlled by the asset's "
+            "Use SSL setting."
+        ),
+        required=False,
+        default=None,
+    )
+
+
+class ImapMakeRequestOutput(ActionOutput):
+    status_code: int = OutputField(example_values=[200])
+    response_body: str = OutputField(example_values=['{"status": "OK", "data": []}'])
+
+    @classmethod
+    def from_imap_response(
+        cls,
+        status: str,
+        data: list | tuple | dict,
+        untagged_responses: dict | None = None,
+    ) -> "ImapMakeRequestOutput":
+        response_body = {
+            "status": status,
+            "data": _decode_imap_response(data),
+        }
+        if untagged_responses:
+            response_body["untagged_responses"] = _decode_imap_response(
+                untagged_responses
+            )
+
+        return cls(
+            status_code=_imap_status_code(status),
+            response_body=json.dumps(response_body),
+        )
+
+
+@app.make_request()
+def make_request(
+    params: ImapMakeRequestParams, soar: SOARClient, asset: Asset
+) -> ImapMakeRequestOutput:
+    _validate_unused_headers(params.headers)
+
+    command, args = _parse_make_request_endpoint(params.endpoint)
+    args.extend(_parse_make_request_args("query_parameters", params.query_parameters))
+    body_args, literal = _parse_make_request_body(params.body)
+    args.extend(body_args)
+
+    method = params.http_method.upper()
+    read_only_request = method in _READ_ONLY_HTTP_METHODS
+    if read_only_request and not _is_read_only_imap_command(command, args):
+        raise ActionFailure(
+            f"IMAP command '{command}' can modify mailbox state. Use POST, PUT, "
+            "PATCH, or DELETE for write-capable commands."
+        )
+
+    timeout = params.timeout if params.timeout is not None else 60
+    if timeout <= 0:
+        raise ActionFailure("timeout must be greater than zero")
+
+    helper = ImapHelper(soar, asset)
+    try:
+        helper._connect_to_server(timeout=timeout, read_only=read_only_request)
+    except Exception as e:
+        raise ActionFailure(f"Request failed: {e}") from e
+
+    if command not in imaplib.Commands:
+        imaplib.Commands[command] = ("AUTH", "SELECTED")
+
+    try:
+        helper._imap_conn.untagged_responses = {}
+        if literal is not None:
+            helper._imap_conn.literal = literal
+        status, data = helper._imap_conn._simple_command(command, *args)
+    except imaplib.IMAP4.error as e:
+        return ImapMakeRequestOutput.from_imap_response("BAD", [str(e)])
+    except Exception as e:
+        raise ActionFailure(f"Request failed: {e}") from e
+
+    response_name = _imap_response_name(command, args)
+    if response_name in helper._imap_conn.untagged_responses:
+        status, data = helper._imap_conn._untagged_response(status, data, response_name)
+
+    return ImapMakeRequestOutput.from_imap_response(
+        status,
+        data,
+        helper._imap_conn.untagged_responses,
+    )
 
 
 class GetEmailSummary(ActionOutput):

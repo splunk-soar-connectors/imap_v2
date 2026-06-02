@@ -1,1 +1,3 @@
 **Unreleased**
+
+* Added make request action for Universal API support
