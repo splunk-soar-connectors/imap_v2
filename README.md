@@ -317,6 +317,7 @@ VARIABLE | REQUIRED | TYPE | DESCRIPTION
 [test connectivity](#action-test-connectivity) - Test connectivity to IMAP server <br>
 [on poll](#action-on-poll) - Poll for new emails and ingest as containers/artifacts <br>
 [on es poll](#action-on-es-poll) - Poll for new emails and create ES findings for each email. <br>
+[make request](#action-make-request) - make request <br>
 [get email](#action-get-email) - Get an email from the server or container
 
 ## action: 'test connectivity'
@@ -384,6 +385,45 @@ PARAMETER | REQUIRED | DESCRIPTION | TYPE | CONTAINS
 #### Action Output
 
 No Output
+
+## action: 'make request'
+
+make request
+
+Type: **generic** <br>
+Read only: **False**
+
+'make request' action for the app. Used to handle arbitrary HTTP requests with the app's asset
+
+#### Action Parameters
+
+PARAMETER | REQUIRED | DESCRIPTION | TYPE | CONTAINS
+--------- | -------- | ----------- | ---- | --------
+**http_method** | required | The HTTP method for Universal API compatibility. GET, HEAD, and OPTIONS allow read-only IMAP commands; POST, PUT, PATCH, and DELETE allow write-capable IMAP commands. | string | |
+**endpoint** | required | IMAP command to run, with optional arguments. Examples: 'NOOP', 'CAPABILITY', 'LIST "" "\*"', or 'UID SEARCH ALL'. | string | |
+**headers** | optional | Not used for IMAP requests. Providing headers will fail the action. | string | |
+**query_parameters** | optional | Optional additional IMAP command arguments as a JSON list, an object with an 'args' list, or a shell-style argument string. | string | |
+**body** | optional | Optional additional IMAP command arguments as a JSON list, an object with an 'args' list, a shell-style argument string, or an object with a 'literal' value for IMAP literal data. | string | |
+**timeout** | optional | The timeout for the request in seconds. | numeric | |
+**verify_ssl** | optional | Not used for IMAP requests; SSL usage is controlled by the asset's Use SSL setting. | boolean | |
+
+#### Action Output
+
+DATA PATH | TYPE | CONTAINS | EXAMPLE VALUES
+--------- | ---- | -------- | --------------
+action_result.status | string | | success failure |
+action_result.message | string | | |
+action_result.parameter.http_method | string | | |
+action_result.parameter.endpoint | string | | |
+action_result.parameter.headers | string | | |
+action_result.parameter.query_parameters | string | | |
+action_result.parameter.body | string | | |
+action_result.parameter.timeout | numeric | | |
+action_result.parameter.verify_ssl | boolean | | |
+action_result.data.\*.status_code | numeric | | 200 |
+action_result.data.\*.response_body | string | | {"status": "OK", "data": []} |
+summary.total_objects | numeric | | 1 |
+summary.total_objects_successful | numeric | | 1 |
 
 ## action: 'get email'
 
