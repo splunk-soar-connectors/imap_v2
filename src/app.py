@@ -1210,10 +1210,18 @@ def make_request(
 
     method = params.http_method.upper()
     read_only_request = method in _READ_ONLY_HTTP_METHODS
-    if read_only_request and not _is_read_only_imap_command(command, args):
+    read_only_command = _is_read_only_imap_command(command, args)
+
+    if read_only_request and not read_only_command:
         raise ActionFailure(
             f"IMAP command '{command}' can modify mailbox state. Use POST, PUT, "
             "PATCH, or DELETE for write-capable commands."
+        )
+
+    if not read_only_request and read_only_command:
+        raise ActionFailure(
+            f"IMAP command '{command}' is read-only. Use GET, HEAD, or OPTIONS "
+            "for read-only commands."
         )
 
     timeout = params.timeout if params.timeout is not None else 60
