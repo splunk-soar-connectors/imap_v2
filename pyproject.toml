@@ -55,6 +55,9 @@ output-format = "full"  # <full|concise>
 fix = true
 target-version = "py313"
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.ruff.lint]
 select = [
     "ERA",  # commented out code

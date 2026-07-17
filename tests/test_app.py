@@ -1,0 +1,45 @@
+# Copyright (c) 2016-2026 Splunk Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under
+# the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied. See the License for the specific language governing permissions
+# and limitations under the License.
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from src import app as imap_app
+
+
+def _asset(**overrides):
+    values = {
+        "auth_type": "Basic",
+        "use_ssl": False,
+        "server": "mail.example.com",
+        "username": "user",
+        "password": None,
+        "folder": "INBOX",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_starttls_failure_prevents_login(mocker):
+    connection = MagicMock()
+    connection.starttls.side_effect = imap_app.imaplib.IMAP4.error("TLS not supported")
+    mocker.patch.object(imap_app.imaplib, "IMAP4", return_value=connection)
+
+    helper = imap_app.ImapHelper(MagicMock(), _asset())
+
+    with pytest.raises(Exception, match="Error connecting to server"):
+        helper._connect_to_server()
+
+    connection.login.assert_not_called()

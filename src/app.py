@@ -11,7 +11,6 @@
 # either express or implied. See the License for the specific language governing permissions
 # and limitations under the License.
 #
-import contextlib
 import email
 import hashlib
 import imaplib
@@ -555,10 +554,9 @@ class Asset(BaseAsset):
     use_ssl: bool = AssetField(
         required=False,
         description="Use SSL",
-        default=False,
+        default=True,
         category=FieldCategory.CONNECTIVITY,
     )
-
     # Ingestion fields
     folder: str = AssetField(
         required=True,
@@ -755,8 +753,7 @@ class ImapHelper:
                 self._imap_conn = imaplib.IMAP4_SSL(server)
             else:
                 self._imap_conn = imaplib.IMAP4(server)
-                with contextlib.suppress(Exception):
-                    self._imap_conn.starttls()
+                self._imap_conn.starttls()
         except Exception as e:
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(IMAP_ERROR_CONNECTING_TO_SERVER, e)
