@@ -159,3 +159,34 @@ benign
 """
 
     assert imap_app._find_forwarded_attachment(outer, raw_email) is None
+
+
+def test_build_vault_artifact_adds_hashes(tmp_path):
+    attachment = tmp_path / "payload.bin"
+    attachment.write_bytes(b"payload")
+    vault = MagicMock()
+    vault.add_attachment.return_value = "vault-id"
+    vault.get_attachment.return_value = [
+        {
+            "metadata": {
+                "sha256": "sha256-value",
+                "sha1": "sha1-value",
+                "md5": "md5-value",
+            }
+        }
+    ]
+
+    artifact = imap_app._build_vault_artifact(
+        vault,
+        {"file_name": "payload.bin", "file_path": str(attachment)},
+        123,
+    )
+
+    vault.add_attachment.assert_called_once_with(
+        container_id=123,
+        file_location=str(attachment),
+        file_name="payload.bin",
+        metadata={},
+    )
+    assert artifact.cef["vaultId"] == "vault-id"
+    assert artifact.cef["fileHashSha256"] == "sha256-value"

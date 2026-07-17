@@ -20,6 +20,7 @@ import socket
 import ssl
 import time
 from collections.abc import Generator, Iterator
+from dataclasses import dataclass
 from datetime import datetime, UTC
 from email.header import decode_header, make_header
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
@@ -44,7 +45,7 @@ from soar_sdk.auth.models import OAuthConfig
 from soar_sdk.exceptions import ActionFailure
 from soar_sdk.extras.email import EmailProcessor, ProcessEmailContext
 from soar_sdk.extras.email.email_data import EmailData, extract_email_data
-from soar_sdk.extras.email.utils import decode_uni_string
+from soar_sdk.extras.email.utils import decode_uni_string, get_file_contains
 from soar_sdk.logging import getLogger
 from soar_sdk.models.artifact import Artifact
 from soar_sdk.models.container import Container
@@ -150,6 +151,65 @@ def _next_email_checkpoint(email_ids: list[int], failed_ids: list[int]) -> int:
     if failed_ids:
         return min(failed_ids)
     return int(email_ids[-1]) + 1
+
+
+@dataclass
+class ParsedEmail:
+    container: Container
+    artifacts: list[Artifact]
+    files: list[dict]
+    processor: EmailProcessor
+
+    def cleanup(self) -> None:
+        self.processor._del_tmp_dirs()
+
+
+def _build_vault_artifact(
+    vault: PhantomVault, file_data: dict, container_id: int
+) -> Artifact:
+    file_path = str(file_data["file_path"])
+    file_name = str(file_data.get("file_name") or Path(file_path).name)
+    vault_id = vault.add_attachment(
+        container_id=container_id,
+        file_location=file_path,
+        file_name=file_name,
+        metadata={},
+    )
+
+    cef = dict(file_data.get("meta_info") or {})
+    cef.update(
+        {
+            "fileName": file_name,
+            "vaultId": vault_id,
+            "cs6": vault_id,
+            "cs6Label": "Vault ID",
+        }
+    )
+    try:
+        vault_info = vault.get_attachment(vault_id=vault_id, download_file=False)
+        metadata = (vault_info[0].get("metadata") or {}) if vault_info else {}
+        for source, target in (
+            ("sha256", "fileHashSha256"),
+            ("sha1", "fileHashSha1"),
+            ("md5", "fileHashMd5"),
+        ):
+            if metadata.get(source):
+                cef[target] = metadata[source]
+    except Exception as e:
+        logger.warning("Could not load vault hashes for %s: %s", file_name, e)
+
+    contains = get_file_contains(file_path)
+    source_data_identifier = hashlib.sha256(
+        json.dumps(cef, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    return Artifact(
+        name="Vault Artifact",
+        container_id=container_id,
+        cef=cef,
+        cef_types={"vaultId": contains, "cs6": contains} if contains else None,
+        source_data_identifier=source_data_identifier,
+        run_automation=False,
+    )
 
 
 def _is_forwarded_email_attachment(filename: str, content_type: str | None) -> bool:
@@ -993,10 +1053,10 @@ class ImapHelper:
         else:
             return uids[:max_emails]
 
-    def _parse_and_create_artifacts(
+    def _parse_email(
         self, email_id, email_data, data_time_info, asset, config=None
-    ):
-        """Parse email and yield Container and Artifacts for ingestion using SDK EmailProcessor"""
+    ) -> ParsedEmail:
+        """Parse an email and retain files until the caller vaults them."""
         epoch = int(time.mktime(datetime.now(tz=UTC).timetuple())) * 1000
 
         if data_time_info:
@@ -1031,19 +1091,21 @@ class ImapHelper:
             email_data, str(email_id), epoch
         )
 
-        if not ret_val:
-            logger.error(f"Failed to process email {email_id}: {message}")
-            return
+        if not ret_val or not results or not results[0].get("container"):
+            email_processor._del_tmp_dirs()
+            raise ActionFailure(f"Failed to process email {email_id}: {message}")
 
-        for result in results:
-            container_dict = result.get("container")
-            if container_dict:
-                yield Container(**container_dict)
-
-            artifacts = result.get("artifacts", [])
-            for artifact_dict in artifacts:
-                if artifact_dict:
-                    yield Artifact(**artifact_dict)
+        result = results[0]
+        return ParsedEmail(
+            container=Container(**result["container"]),
+            artifacts=[
+                Artifact(**artifact_dict)
+                for artifact_dict in result.get("artifacts", [])
+                if artifact_dict
+            ],
+            files=list(result.get("files", [])),
+            processor=email_processor,
+        )
 
 
 @app.test_connectivity()
@@ -1147,10 +1209,20 @@ def on_poll(
     for email_id in email_ids:
         try:
             email_data, data_time_info = helper._get_email_data(email_id)
-
-            yield from helper._parse_and_create_artifacts(
-                email_id, email_data, data_time_info, asset
-            )
+            parsed = helper._parse_email(email_id, email_data, data_time_info, asset)
+            try:
+                yield parsed.container
+                if parsed.container.container_id is None:
+                    raise ActionFailure(f"Container was not saved for email {email_id}")
+                yield from parsed.artifacts
+                for file_data in parsed.files:
+                    yield _build_vault_artifact(
+                        PhantomVault(soar),
+                        file_data,
+                        int(parsed.container.container_id),
+                    )
+            finally:
+                parsed.cleanup()
 
         except Exception as e:
             logger.error(f"Error processing email {email_id}: {e}")
@@ -1534,31 +1606,31 @@ def get_email(params: GetEmailParams, soar: SOARClient, asset: Asset) -> GetEmai
                 "extract_urls": True,
             }
 
-            containers_and_artifacts = list(
-                helper._parse_and_create_artifacts(
-                    params.id, email_data, data_time_info, asset, config=config
-                )
+            parsed = helper._parse_email(
+                params.id, email_data, data_time_info, asset, config=config
             )
+            try:
+                ret_val, message, container_id = app.actions_manager.save_container(
+                    parsed.container.to_dict()
+                )
+                if not ret_val or not container_id:
+                    raise ActionFailure(f"Failed to save email container: {message}")
 
-            for obj in containers_and_artifacts:
-                if isinstance(obj, Container):
-                    container_dict = obj.to_dict()
-                    ret_val, message, cid = app.actions_manager.save_container(
-                        container_dict
-                    )
-                    if ret_val:
-                        container_id = cid
-                    break
-
-            if container_id:
                 artifacts_to_save = []
-                for obj in containers_and_artifacts:
-                    if isinstance(obj, Artifact):
-                        artifact_dict = obj.to_dict()
-                        artifact_dict["container_id"] = container_id
-                        artifacts_to_save.append(artifact_dict)
+                for artifact in parsed.artifacts:
+                    artifact.container_id = container_id
+                    artifacts_to_save.append(artifact.to_dict())
+                vault = PhantomVault(soar)
+                for file_data in parsed.files:
+                    artifacts_to_save.append(
+                        _build_vault_artifact(
+                            vault, file_data, int(container_id)
+                        ).to_dict()
+                    )
                 if artifacts_to_save:
                     app.actions_manager.save_artifacts(artifacts_to_save)
+            finally:
+                parsed.cleanup()
 
             message = f"Email ingested with container ID: {container_id}"
             soar.set_summary(GetEmailSummary(container_id=container_id))

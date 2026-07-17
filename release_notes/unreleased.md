@@ -9,3 +9,4 @@
 * - Replaced missing SDK container helpers with a validated SOAR REST lookup in get email.
 * - Preserved outer-message URLs, attachments, and raw email evidence in forwarded-email ES findings.
 * - Restricted forwarded-email reclassification to actual attachments so inline decoy messages cannot mask an ES finding.
+* - Vaulted ingested email attachments and removed EmailProcessor temporary directories after every message.
