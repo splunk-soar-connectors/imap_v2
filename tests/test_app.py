@@ -75,3 +75,7 @@ def test_mailbox_name_is_quoted_and_line_breaks_are_rejected():
 
     with pytest.raises(ValueError, match="line breaks"):
         imap_app._quote_mailbox("INBOX\r\nA001 DELETE INBOX")
+
+
+def test_get_email_is_not_read_only():
+    assert imap_app.get_email.meta.read_only is False
