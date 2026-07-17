@@ -7,3 +7,4 @@
 * - Marked get email as state-changing because its ingest option can write attachments to the SOAR vault.
 * - Held polling checkpoints at the first failed email so transient parsing failures are retried instead of skipped.
 * - Replaced missing SDK container helpers with a validated SOAR REST lookup in get email.
+* - Preserved outer-message URLs, attachments, and raw email evidence in forwarded-email ES findings.

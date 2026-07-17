@@ -15,6 +15,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from soar_sdk.extras.email.email_data import (
+    EmailAttachment,
+    EmailBody,
+    EmailData,
+    EmailHeaders,
+)
 
 from src import app as imap_app
 
@@ -90,3 +96,44 @@ def test_checkpoint_stops_at_first_failed_email():
 def test_invalid_container_id_is_rejected(value):
     with pytest.raises(ValueError, match="Container ID"):
         imap_app._validate_soar_id(value)
+
+
+def test_forwarded_finding_preserves_outer_evidence():
+    outer = EmailData(
+        raw_email="From: reporter@example.com\r\n\r\nouter",
+        headers=EmailHeaders(from_address="reporter@example.com"),
+        body=EmailBody(plain_text="outer"),
+        urls=["https://outer.example/phish"],
+        attachments=[
+            EmailAttachment(
+                filename="payload.bin",
+                content_type="application/octet-stream",
+                content=b"payload",
+            )
+        ],
+    )
+    inner = EmailData(
+        raw_email="From: sender@example.com\r\n\r\ninner",
+        headers=EmailHeaders(from_address="sender@example.com"),
+        body=EmailBody(plain_text="inner"),
+        urls=["https://inner.example/message"],
+    )
+
+    finding = imap_app._build_forwarded_finding(
+        "42",
+        outer.raw_email,
+        inner.raw_email.encode(),
+        "forwarded.eml",
+        outer,
+        inner,
+    )
+
+    assert finding.email.urls == [
+        "https://inner.example/message",
+        "https://outer.example/phish",
+    ]
+    assert {attachment.file_name for attachment in finding.attachments} == {
+        "forwarded.eml",
+        "email_42.eml",
+        "payload.bin",
+    }

@@ -260,7 +260,12 @@ def _build_finding_from_email(
         inner_data = _parse_attached_email(content, email_id)
         if inner_data:
             return _build_forwarded_finding(
-                email_id, content, filename, outer_data, inner_data
+                email_id,
+                raw_email,
+                content,
+                filename,
+                outer_data,
+                inner_data,
             )
         logger.warning(
             "Failed to parse forwarded attachment %s, treating as normal email",
@@ -461,6 +466,7 @@ def _build_forwarded_title(outer_data: EmailData, inner_data: EmailData) -> str:
 
 def _build_forwarded_finding(
     email_id: str,
+    outer_raw: str,
     inner_raw: bytes,
     inner_filename: str,
     outer_data: EmailData,
@@ -475,7 +481,12 @@ def _build_forwarded_finding(
             file_name=inner_filename,
             data=inner_raw,
             is_raw_email=True,
-        )
+        ),
+        FindingAttachment(
+            file_name=f"email_{email_id}.eml",
+            data=outer_raw.encode("utf-8"),
+            is_raw_email=True,
+        ),
     ]
     for att in inner_data.attachments:
         if att.content:
@@ -487,12 +498,28 @@ def _build_forwarded_finding(
                 )
             )
 
+    for att in outer_data.attachments:
+        if (
+            att.content
+            and att.filename != inner_filename
+            and not _is_forwarded_email_attachment(att.filename, att.content_type)
+        ):
+            attachments.append(
+                FindingAttachment(
+                    file_name=att.filename,
+                    data=att.content,
+                    is_raw_email=False,
+                )
+            )
+
+    urls = list(dict.fromkeys([*inner_data.urls, *outer_data.urls]))
+
     return Finding(
         rule_title=_build_forwarded_title(outer_data, inner_data),
         email=FindingEmail(
             headers=email_headers or None,
             body=body_text or None,
-            urls=inner_data.urls or None,
+            urls=urls or None,
             reporter=_build_reporter(outer_data, email_id),
         ),
         attachments=attachments,
