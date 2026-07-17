@@ -5,3 +5,4 @@
 * - Added IMAP server certificate verification with the SOAR CA bundle and an explicit compatibility opt-out.
 * - Validated email UIDs and safely quoted mailbox names to prevent authenticated IMAP command injection.
 * - Marked get email as state-changing because its ingest option can write attachments to the SOAR vault.
+* - Held polling checkpoints at the first failed email so transient parsing failures are retried instead of skipped.

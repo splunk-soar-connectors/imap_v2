@@ -79,3 +79,8 @@ def test_mailbox_name_is_quoted_and_line_breaks_are_rejected():
 
 def test_get_email_is_not_read_only():
     assert imap_app.get_email.meta.read_only is False
+
+
+def test_checkpoint_stops_at_first_failed_email():
+    assert imap_app._next_email_checkpoint([10, 11, 12], [11]) == 11
+    assert imap_app._next_email_checkpoint([10, 11, 12], []) == 13

@@ -136,6 +136,12 @@ def _quote_mailbox(folder: str) -> str:
     return f'"{escaped}"'
 
 
+def _next_email_checkpoint(email_ids: list[int], failed_ids: list[int]) -> int:
+    if failed_ids:
+        return min(failed_ids)
+    return int(email_ids[-1]) + 1
+
+
 def _is_forwarded_email_attachment(filename: str, content_type: str | None) -> bool:
     lower = filename.lower()
     if lower.endswith((".eml", ".msg")):
@@ -1097,6 +1103,7 @@ def on_poll(
         logger.info("No new emails to ingest")
         return
 
+    failed_ids: list[int] = []
     for email_id in email_ids:
         try:
             email_data, data_time_info = helper._get_email_data(email_id)
@@ -1107,10 +1114,11 @@ def on_poll(
 
         except Exception as e:
             logger.error(f"Error processing email {email_id}: {e}")
+            failed_ids.append(int(email_id))
             continue
 
     if email_ids and not is_poll_now:
-        state["next_muid"] = int(email_ids[-1]) + 1
+        state["next_muid"] = _next_email_checkpoint(email_ids, failed_ids)
         state["first_run"] = False
 
 
@@ -1141,6 +1149,7 @@ def on_es_poll(
         logger.info("No new emails to ingest for ES")
         return
 
+    failed_ids: list[int] = []
     for email_id in email_ids:
         try:
             raw_email, _data_time_info = helper._get_email_data(email_id)
@@ -1149,13 +1158,15 @@ def on_es_poll(
             )
         except Exception as e:
             logger.error(f"Error processing email {email_id} for ES: {e}")
+            failed_ids.append(int(email_id))
             continue
 
         finding = _build_finding_from_email(str(email_id), raw_email, outer_data)
 
-        state["es_next_muid"] = int(email_id) + 1
-
         yield finding
+
+    if email_ids and not is_poll_now:
+        state["es_next_muid"] = _next_email_checkpoint(email_ids, failed_ids)
 
 
 class ImapMakeRequestParams(MakeRequestParams):
