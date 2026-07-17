@@ -27,6 +27,7 @@ def _asset(**overrides):
         "username": "user",
         "password": None,
         "folder": "INBOX",
+        "verify_server_cert": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -43,3 +44,18 @@ def test_starttls_failure_prevents_login(mocker):
         helper._connect_to_server()
 
     connection.login.assert_not_called()
+
+
+def test_ssl_connection_uses_validating_context(mocker):
+    context = MagicMock()
+    mocker.patch.object(imap_app, "_create_ssl_context", return_value=context)
+    ssl_connection = mocker.patch.object(imap_app.imaplib, "IMAP4_SSL")
+    connection = ssl_connection.return_value
+    connection.login.return_value = ("OK", [])
+    connection.list.return_value = ("OK", [])
+    connection.select.return_value = ("OK", [])
+
+    helper = imap_app.ImapHelper(MagicMock(), _asset(use_ssl=True))
+    helper._connect_to_server()
+
+    ssl_connection.assert_called_once_with("mail.example.com", ssl_context=context)

@@ -17,11 +17,13 @@ import imaplib
 import json
 import shlex
 import socket
+import ssl
 import time
 from collections.abc import Generator, Iterator
 from datetime import datetime, UTC
 from email.header import decode_header, make_header
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
+from pathlib import Path
 
 from pydantic import Field as PydanticField
 
@@ -100,6 +102,19 @@ _READ_ONLY_IMAP_COMMANDS = {
     "UID",
 }
 _READ_ONLY_UID_COMMANDS = {"FETCH", "SEARCH", "SORT", "THREAD"}
+_SOAR_CA_BUNDLE = Path("/opt/phantom/etc/cacerts.pem")
+
+
+def _create_ssl_context(verify_server_cert: bool) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if verify_server_cert:
+        if _SOAR_CA_BUNDLE.is_file():
+            context.load_verify_locations(cafile=str(_SOAR_CA_BUNDLE))
+        return context
+
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 def _is_forwarded_email_attachment(filename: str, content_type: str | None) -> bool:
@@ -557,6 +572,12 @@ class Asset(BaseAsset):
         default=True,
         category=FieldCategory.CONNECTIVITY,
     )
+    verify_server_cert: bool = AssetField(
+        required=False,
+        description="Verify IMAP server certificate",
+        default=True,
+        category=FieldCategory.CONNECTIVITY,
+    )
     # Ingestion fields
     folder: str = AssetField(
         required=True,
@@ -745,15 +766,16 @@ class ImapHelper:
         is_oauth = self.asset.auth_type == "OAuth"
         use_ssl = self.asset.use_ssl
         server = self.asset.server
+        ssl_context = _create_ssl_context(self.asset.verify_server_cert)
 
         socket.setdefaulttimeout(timeout)
 
         try:
             if is_oauth or use_ssl:
-                self._imap_conn = imaplib.IMAP4_SSL(server)
+                self._imap_conn = imaplib.IMAP4_SSL(server, ssl_context=ssl_context)
             else:
                 self._imap_conn = imaplib.IMAP4(server)
-                self._imap_conn.starttls()
+                self._imap_conn.starttls(ssl_context=ssl_context)
         except Exception as e:
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(IMAP_ERROR_CONNECTING_TO_SERVER, e)

@@ -301,6 +301,7 @@ VARIABLE | REQUIRED | TYPE | DESCRIPTION
 **token_url** | optional | string | OAuth Token URL |
 **scopes** | optional | string | OAuth API Scope (JSON formatted list) |
 **use_ssl** | optional | boolean | Use SSL |
+**verify_server_cert** | optional | boolean | Verify IMAP server certificate |
 **folder** | required | string | Folder to ingest mails from (default is inbox) |
 **ingest_manner** | required | string | How to ingest |
 **first_run_max_emails** | required | numeric | Maximum emails to poll first time for schedule and interval polling |
