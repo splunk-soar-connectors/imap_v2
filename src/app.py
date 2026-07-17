@@ -239,7 +239,10 @@ def _find_forwarded_attachment(
     # so scan the raw message directly for embedded email parts.
     mail = email.message_from_string(raw_email)
     for part in mail.walk():
-        if part.get_content_type() == "message/rfc822":
+        if (
+            part.get_content_type() == "message/rfc822"
+            and part.get_content_disposition() == "attachment"
+        ):
             payload = part.get_payload()
             if isinstance(payload, list) and payload:
                 inner_msg = payload[0]

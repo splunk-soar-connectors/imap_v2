@@ -137,3 +137,25 @@ def test_forwarded_finding_preserves_outer_evidence():
         "email_42.eml",
         "payload.bin",
     }
+
+
+def test_inline_rfc822_part_does_not_reclassify_outer_email():
+    outer = EmailData(
+        raw_email="",
+        headers=EmailHeaders(from_address="sender@example.com"),
+        body=EmailBody(plain_text="outer"),
+    )
+    raw_email = """MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary=BOUNDARY
+
+--BOUNDARY
+Content-Type: message/rfc822
+
+From: decoy@example.com
+Subject: Decoy
+
+benign
+--BOUNDARY--
+"""
+
+    assert imap_app._find_forwarded_attachment(outer, raw_email) is None
