@@ -103,6 +103,7 @@ _READ_ONLY_IMAP_COMMANDS = {
 }
 _READ_ONLY_UID_COMMANDS = {"FETCH", "SEARCH", "SORT", "THREAD"}
 _SOAR_CA_BUNDLE = Path("/opt/phantom/etc/cacerts.pem")
+_MAX_IMAP_UID = 4_294_967_295
 
 
 def _create_ssl_context(verify_server_cert: bool) -> ssl.SSLContext:
@@ -115,6 +116,24 @@ def _create_ssl_context(verify_server_cert: bool) -> ssl.SSLContext:
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     return context
+
+
+def _validate_imap_uid(value: str | int) -> str:
+    uid = str(value)
+    if not uid.isascii() or not uid.isdecimal():
+        raise ValueError("Email ID must be a positive integer")
+    numeric_uid = int(uid)
+    if not 0 < numeric_uid <= _MAX_IMAP_UID:
+        raise ValueError("Email ID must be between 1 and 4294967295")
+    return uid
+
+
+def _quote_mailbox(folder: str) -> str:
+    if "\r" in folder or "\n" in folder:
+        raise ValueError("Folder must not contain line breaks")
+    encoded = imap_utf7.encode(folder).decode()
+    escaped = encoded.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _is_forwarded_email_attachment(filename: str, content_type: str | None) -> bool:
@@ -835,7 +854,7 @@ class ImapHelper:
         self._folder_name = self.asset.folder
         try:
             result, _ = self._imap_conn.select(
-                f'"{imap_utf7.encode(self._folder_name).decode()}"', read_only
+                _quote_mailbox(self._folder_name), read_only
             )
         except Exception as e:
             raise Exception(
@@ -853,11 +872,10 @@ class ImapHelper:
 
     def _get_email_data(self, muuid, folder=None, is_diff=False):
         """Get email data from IMAP server"""
+        muuid = _validate_imap_uid(muuid)
         if is_diff and folder:
             try:
-                result, data = self._imap_conn.select(
-                    f'"{imap_utf7.encode(folder).decode()}"', True
-                )
+                result, data = self._imap_conn.select(_quote_mailbox(folder), True)
             except Exception as e:
                 raise Exception(
                     IMAP_GENERAL_ERROR_MESSAGE.format(
@@ -873,10 +891,6 @@ class ImapHelper:
         try:
             (result, data) = self._imap_conn.uid(
                 "fetch", muuid, "(INTERNALDATE RFC822)"
-            )
-        except TypeError:
-            (result, data) = self._imap_conn.uid(
-                "fetch", str(muuid), "(INTERNALDATE RFC822)"
             )
         except Exception as e:
             raise Exception(IMAP_FETCH_ID_FAILED.format(muuid=muuid, excep=e)) from e

@@ -59,3 +59,19 @@ def test_ssl_connection_uses_validating_context(mocker):
     helper._connect_to_server()
 
     ssl_connection.assert_called_once_with("mail.example.com", ssl_context=context)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["1\r\nA001 DELETE INBOX", "0", "-1", "\uff11\uff12"],
+)
+def test_invalid_email_id_is_rejected(value):
+    with pytest.raises(ValueError, match="Email ID"):
+        imap_app._validate_imap_uid(value)
+
+
+def test_mailbox_name_is_quoted_and_line_breaks_are_rejected():
+    assert imap_app._quote_mailbox('folder "name"') == '"folder \\"name\\""'
+
+    with pytest.raises(ValueError, match="line breaks"):
+        imap_app._quote_mailbox("INBOX\r\nA001 DELETE INBOX")
