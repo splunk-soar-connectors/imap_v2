@@ -105,6 +105,7 @@ _READ_ONLY_IMAP_COMMANDS = {
 _READ_ONLY_UID_COMMANDS = {"FETCH", "SEARCH", "SORT", "THREAD"}
 _SOAR_CA_BUNDLE = Path("/opt/phantom/etc/cacerts.pem")
 _MAX_IMAP_UID = 4_294_967_295
+_MAX_EMAIL_PROCESSING_ATTEMPTS = 3
 
 
 def _create_ssl_context(verify_server_cert: bool) -> ssl.SSLContext:
@@ -147,10 +148,26 @@ def _quote_mailbox(folder: str) -> str:
     return f'"{escaped}"'
 
 
-def _next_email_checkpoint(email_ids: list[int], failed_ids: list[int]) -> int:
-    if failed_ids:
-        return min(failed_ids)
-    return int(email_ids[-1]) + 1
+def _next_email_checkpoint(
+    email_ids: list[int],
+    failed_ids: list[int],
+    retry_counts: dict[str, int],
+) -> tuple[int, dict[str, int], list[int]]:
+    """Advance after successes while retrying each failed UID a bounded number of times."""
+    updated_counts: dict[str, int] = {}
+    retryable_ids: list[int] = []
+    exhausted_ids: list[int] = []
+
+    for email_id in failed_ids:
+        attempts = int(retry_counts.get(str(email_id), 0)) + 1
+        if attempts < _MAX_EMAIL_PROCESSING_ATTEMPTS:
+            updated_counts[str(email_id)] = attempts
+            retryable_ids.append(email_id)
+        else:
+            exhausted_ids.append(email_id)
+
+    checkpoint = min(retryable_ids) if retryable_ids else int(email_ids[-1]) + 1
+    return checkpoint, updated_counts, exhausted_ids
 
 
 @dataclass
@@ -1230,8 +1247,25 @@ def on_poll(
             continue
 
     if email_ids and not is_poll_now:
-        state["next_muid"] = _next_email_checkpoint(email_ids, failed_ids)
+        checkpoint, retry_counts, exhausted_ids = _next_email_checkpoint(
+            email_ids,
+            failed_ids,
+            state.get("failed_muid_retries", {}),
+        )
+        state["next_muid"] = checkpoint
+        state["failed_muid_retries"] = retry_counts
         state["first_run"] = False
+        if failed_ids:
+            retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))
+            message = f"Email processing failed for UIDs {sorted(failed_ids)}."
+            if retryable_ids:
+                message += f" Retrying UIDs {retryable_ids} on the next poll."
+            if exhausted_ids:
+                message += (
+                    f" Skipping UIDs {sorted(exhausted_ids)} after "
+                    f"{_MAX_EMAIL_PROCESSING_ATTEMPTS} failed attempts."
+                )
+            soar.set_message(message)
 
 
 @app.on_es_poll()
@@ -1278,7 +1312,24 @@ def on_es_poll(
         yield finding
 
     if email_ids and not is_poll_now:
-        state["es_next_muid"] = _next_email_checkpoint(email_ids, failed_ids)
+        checkpoint, retry_counts, exhausted_ids = _next_email_checkpoint(
+            email_ids,
+            failed_ids,
+            state.get("es_failed_muid_retries", {}),
+        )
+        state["es_next_muid"] = checkpoint
+        state["es_failed_muid_retries"] = retry_counts
+        if failed_ids:
+            retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))
+            message = f"ES email processing failed for UIDs {sorted(failed_ids)}."
+            if retryable_ids:
+                message += f" Retrying UIDs {retryable_ids} on the next poll."
+            if exhausted_ids:
+                message += (
+                    f" Skipping UIDs {sorted(exhausted_ids)} after "
+                    f"{_MAX_EMAIL_PROCESSING_ATTEMPTS} failed attempts."
+                )
+            soar.set_message(message)
 
 
 class ImapMakeRequestParams(MakeRequestParams):

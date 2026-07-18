@@ -87,9 +87,25 @@ def test_get_email_is_not_read_only():
     assert imap_app.get_email.meta.read_only is False
 
 
-def test_checkpoint_stops_at_first_failed_email():
-    assert imap_app._next_email_checkpoint([10, 11, 12], [11]) == 11
-    assert imap_app._next_email_checkpoint([10, 11, 12], []) == 13
+def test_checkpoint_retries_failed_email_without_blocking_forever():
+    checkpoint, retry_counts, exhausted = imap_app._next_email_checkpoint(
+        [10, 11, 12], [11], {}
+    )
+    assert (checkpoint, retry_counts, exhausted) == (11, {"11": 1}, [])
+
+    checkpoint, retry_counts, exhausted = imap_app._next_email_checkpoint(
+        [11, 12, 13], [11], {"11": 1}
+    )
+    assert (checkpoint, retry_counts, exhausted) == (11, {"11": 2}, [])
+
+    checkpoint, retry_counts, exhausted = imap_app._next_email_checkpoint(
+        [11, 12, 13], [11], {"11": 2}
+    )
+    assert (checkpoint, retry_counts, exhausted) == (14, {}, [11])
+
+
+def test_checkpoint_advances_after_success():
+    assert imap_app._next_email_checkpoint([10, 11, 12], [], {}) == (13, {}, [])
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "1/artifacts", "\uff11"])
