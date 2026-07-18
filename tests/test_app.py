@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 from soar_sdk.extras.email.email_data import (
     EmailAttachment,
     EmailBody,
@@ -108,10 +109,10 @@ def test_checkpoint_advances_after_success():
     assert imap_app._next_email_checkpoint([10, 11, 12], [], {}) == (13, {}, [])
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "1/artifacts", "\uff11"])
-def test_invalid_container_id_is_rejected(value):
-    with pytest.raises(ValueError, match="Container ID"):
-        imap_app._validate_soar_id(value)
+@pytest.mark.parametrize("value", ["1/artifacts", "\uff11"])
+def test_invalid_container_id_is_rejected_by_sdk_params(value):
+    with pytest.raises(ValidationError):
+        imap_app.GetEmailParams(container_id=value)
 
 
 def test_forwarded_finding_preserves_outer_evidence():

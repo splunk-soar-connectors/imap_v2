@@ -130,16 +130,6 @@ def _validate_imap_uid(value: str | int) -> str:
     return uid
 
 
-def _validate_soar_id(value: str | int) -> int:
-    identifier = str(value)
-    if not identifier.isascii() or not identifier.isdecimal():
-        raise ValueError("Container ID must be a positive integer")
-    numeric_id = int(identifier)
-    if numeric_id <= 0:
-        raise ValueError("Container ID must be a positive integer")
-    return numeric_id
-
-
 def _quote_mailbox(folder: str) -> str:
     if "\r" in folder or "\n" in folder:
         raise ValueError("Folder must not contain line breaks")
@@ -1479,12 +1469,12 @@ class GetEmailParams(Params):
         cef_types=["imap email id"],
         default="",
     )
-    container_id: str = Param(
+    container_id: int | None = Param(
         description="Container ID to get email data from",
         required=False,
         primary=True,
         cef_types=["phantom container id"],
-        default="",
+        default=None,
     )
     folder: str = Param(
         description="Folder name of email to get(used when id is given as input)",
@@ -1698,8 +1688,7 @@ def get_email(params: GetEmailParams, soar: SOARClient, asset: Asset) -> GetEmai
         return GetEmailOutput(**ret_val)
 
     if params.container_id:
-        container_id = _validate_soar_id(params.container_id)
-        container = soar.get(f"/rest/container/{container_id}").json()
+        container = soar.get(f"/rest/container/{params.container_id}").json()
         if not isinstance(container, dict) or not container:
             raise ValueError(f"Container with ID {params.container_id} not found")
 

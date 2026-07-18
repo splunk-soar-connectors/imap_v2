@@ -440,7 +440,7 @@ Every container that is created by the IMAP app has the following values:<ul><li
 PARAMETER | REQUIRED | DESCRIPTION | TYPE | CONTAINS
 --------- | -------- | ----------- | ---- | --------
 **id** | optional | Message ID to get | string | `imap email id` |
-**container_id** | optional | Container ID to get email data from | string | `phantom container id` |
+**container_id** | optional | Container ID to get email data from | numeric | `phantom container id` |
 **folder** | optional | Folder name of email to get(used when id is given as input) | string | |
 **ingest_email** | optional | Create container and artifacts | boolean | |
 
@@ -451,7 +451,7 @@ DATA PATH | TYPE | CONTAINS | EXAMPLE VALUES
 action_result.status | string | | success failure |
 action_result.message | string | | |
 action_result.parameter.id | string | `imap email id` | |
-action_result.parameter.container_id | string | `phantom container id` | |
+action_result.parameter.container_id | numeric | `phantom container id` | |
 action_result.parameter.folder | string | | |
 action_result.parameter.ingest_email | boolean | | |
 action_result.data.\*.message | string | | |
