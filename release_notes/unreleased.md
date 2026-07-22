@@ -1,1 +1,12 @@
 **Unreleased**
+
+* Updated the Splunk SOAR SDK to version 3.26.1 to incorporate the latest OAuth and email handling improvements.
+* Required encrypted IMAP authentication by default and stopped continuing after a failed STARTTLS upgrade.
+* Added IMAP server certificate verification with the SOAR CA bundle and an explicit compatibility opt-out.
+* Validated email UIDs and safely quoted mailbox names to prevent authenticated IMAP command injection.
+* Marked get email as state-changing because its ingest option can write attachments to the SOAR vault.
+* Retried failed emails up to three times without permanently blocking later ingestion and surfaced exhausted retries.
+* Replaced missing SDK container helpers with a typed SDK parameter and SOAR REST lookup in get email.
+* Preserved outer-message URLs, attachments, and raw email evidence in forwarded-email ES findings.
+* Restricted forwarded-email reclassification to actual attachments so inline decoy messages cannot mask an ES finding.
+* Vaulted ingested email attachments and removed EmailProcessor temporary directories after every message.

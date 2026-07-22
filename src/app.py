@@ -11,18 +11,20 @@
 # either express or implied. See the License for the specific language governing permissions
 # and limitations under the License.
 #
-import contextlib
 import email
 import hashlib
 import imaplib
 import json
 import shlex
 import socket
+import ssl
 import time
 from collections.abc import Generator, Iterator
+from dataclasses import dataclass
 from datetime import datetime, UTC
 from email.header import decode_header, make_header
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
+from pathlib import Path
 
 from pydantic import Field as PydanticField
 
@@ -43,7 +45,7 @@ from soar_sdk.auth.models import OAuthConfig
 from soar_sdk.exceptions import ActionFailure
 from soar_sdk.extras.email import EmailProcessor, ProcessEmailContext
 from soar_sdk.extras.email.email_data import EmailData, extract_email_data
-from soar_sdk.extras.email.utils import decode_uni_string
+from soar_sdk.extras.email.utils import decode_uni_string, get_file_contains
 from soar_sdk.logging import getLogger
 from soar_sdk.models.artifact import Artifact
 from soar_sdk.models.container import Container
@@ -101,6 +103,132 @@ _READ_ONLY_IMAP_COMMANDS = {
     "UID",
 }
 _READ_ONLY_UID_COMMANDS = {"FETCH", "SEARCH", "SORT", "THREAD"}
+_SOAR_CA_BUNDLE = Path("/opt/phantom/etc/cacerts.pem")
+_MAX_IMAP_UID = 4_294_967_295
+_MAX_EMAIL_PROCESSING_ATTEMPTS = 3
+
+
+def _create_ssl_context(verify_server_cert: bool) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if verify_server_cert:
+        if _SOAR_CA_BUNDLE.is_file():
+            context.load_verify_locations(cafile=str(_SOAR_CA_BUNDLE))
+        return context
+
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _validate_imap_uid(value: str | int) -> str:
+    uid = str(value)
+    if not uid.isascii() or not uid.isdecimal():
+        raise ValueError("Email ID must be a positive integer")
+    numeric_uid = int(uid)
+    if not 0 < numeric_uid <= _MAX_IMAP_UID:
+        raise ValueError("Email ID must be between 1 and 4294967295")
+    return uid
+
+
+def _quote_mailbox(folder: str) -> str:
+    if "\r" in folder or "\n" in folder:
+        raise ValueError("Folder must not contain line breaks")
+    encoded = imap_utf7.encode(folder).decode()
+    escaped = encoded.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _email_ids_for_poll(
+    new_email_ids: list[int],
+    retry_counts: dict[str, int],
+    manner: str,
+) -> list[int]:
+    """Combine newly selected UIDs with every pending retry UID."""
+    email_ids = set(new_email_ids)
+    email_ids.update(int(email_id) for email_id in retry_counts)
+    return sorted(email_ids, reverse=manner == "latest first")
+
+
+def _next_email_poll_state(
+    current_high_water: int,
+    new_email_ids: list[int],
+    failed_ids: list[int],
+    retry_counts: dict[str, int],
+) -> tuple[int, dict[str, int], list[int]]:
+    """Advance the high-water mark and independently retain bounded retries."""
+    updated_counts: dict[str, int] = {}
+    exhausted_ids: list[int] = []
+
+    for email_id in sorted(set(failed_ids)):
+        attempts = int(retry_counts.get(str(email_id), 0)) + 1
+        if attempts < _MAX_EMAIL_PROCESSING_ATTEMPTS:
+            updated_counts[str(email_id)] = attempts
+        else:
+            exhausted_ids.append(email_id)
+
+    high_water = int(current_high_water)
+    if new_email_ids:
+        high_water = max(high_water, max(new_email_ids) + 1)
+    return high_water, updated_counts, exhausted_ids
+
+
+@dataclass
+class ParsedEmail:
+    container: Container
+    artifacts: list[Artifact]
+    files: list[dict]
+    processor: EmailProcessor
+
+    def cleanup(self) -> None:
+        self.processor._del_tmp_dirs()
+
+
+def _build_vault_artifact(
+    vault: PhantomVault, file_data: dict, container_id: int
+) -> Artifact:
+    file_path = str(file_data["file_path"])
+    file_name = str(file_data.get("file_name") or Path(file_path).name)
+    vault_id = vault.add_attachment(
+        container_id=container_id,
+        file_location=file_path,
+        file_name=file_name,
+        metadata={},
+    )
+
+    cef = dict(file_data.get("meta_info") or {})
+    cef.update(
+        {
+            "fileName": file_name,
+            "vaultId": vault_id,
+            "cs6": vault_id,
+            "cs6Label": "Vault ID",
+        }
+    )
+    try:
+        vault_info = vault.get_attachment(vault_id=vault_id, download_file=False)
+        metadata = (vault_info[0].get("metadata") or {}) if vault_info else {}
+        for source, target in (
+            ("sha256", "fileHashSha256"),
+            ("sha1", "fileHashSha1"),
+            ("md5", "fileHashMd5"),
+        ):
+            if metadata.get(source):
+                cef[target] = metadata[source]
+    except Exception as e:
+        logger.warning("Could not load vault hashes for %s: %s", file_name, e)
+
+    contains = get_file_contains(file_path)
+    source_data_identifier = hashlib.sha256(
+        json.dumps(cef, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    return Artifact(
+        name="Vault Artifact",
+        container_id=container_id,
+        cef=cef,
+        cef_types={"vaultId": contains, "cs6": contains} if contains else None,
+        source_data_identifier=source_data_identifier,
+        run_automation=False,
+    )
 
 
 def _is_forwarded_email_attachment(filename: str, content_type: str | None) -> bool:
@@ -190,7 +318,10 @@ def _find_forwarded_attachment(
     # so scan the raw message directly for embedded email parts.
     mail = email.message_from_string(raw_email)
     for part in mail.walk():
-        if part.get_content_type() == "message/rfc822":
+        if (
+            part.get_content_type() == "message/rfc822"
+            and part.get_content_disposition() == "attachment"
+        ):
             payload = part.get_payload()
             if isinstance(payload, list) and payload:
                 inner_msg = payload[0]
@@ -211,7 +342,12 @@ def _build_finding_from_email(
         inner_data = _parse_attached_email(content, email_id)
         if inner_data:
             return _build_forwarded_finding(
-                email_id, content, filename, outer_data, inner_data
+                email_id,
+                raw_email,
+                content,
+                filename,
+                outer_data,
+                inner_data,
             )
         logger.warning(
             "Failed to parse forwarded attachment %s, treating as normal email",
@@ -412,6 +548,7 @@ def _build_forwarded_title(outer_data: EmailData, inner_data: EmailData) -> str:
 
 def _build_forwarded_finding(
     email_id: str,
+    outer_raw: str,
     inner_raw: bytes,
     inner_filename: str,
     outer_data: EmailData,
@@ -426,7 +563,12 @@ def _build_forwarded_finding(
             file_name=inner_filename,
             data=inner_raw,
             is_raw_email=True,
-        )
+        ),
+        FindingAttachment(
+            file_name=f"email_{email_id}.eml",
+            data=outer_raw.encode("utf-8"),
+            is_raw_email=True,
+        ),
     ]
     for att in inner_data.attachments:
         if att.content:
@@ -438,12 +580,28 @@ def _build_forwarded_finding(
                 )
             )
 
+    for att in outer_data.attachments:
+        if (
+            att.content
+            and att.filename != inner_filename
+            and not _is_forwarded_email_attachment(att.filename, att.content_type)
+        ):
+            attachments.append(
+                FindingAttachment(
+                    file_name=att.filename,
+                    data=att.content,
+                    is_raw_email=False,
+                )
+            )
+
+    urls = list(dict.fromkeys([*inner_data.urls, *outer_data.urls]))
+
     return Finding(
         rule_title=_build_forwarded_title(outer_data, inner_data),
         email=FindingEmail(
             headers=email_headers or None,
             body=body_text or None,
-            urls=inner_data.urls or None,
+            urls=urls or None,
             reporter=_build_reporter(outer_data, email_id),
         ),
         attachments=attachments,
@@ -555,10 +713,15 @@ class Asset(BaseAsset):
     use_ssl: bool = AssetField(
         required=False,
         description="Use SSL",
-        default=False,
+        default=True,
         category=FieldCategory.CONNECTIVITY,
     )
-
+    verify_server_cert: bool = AssetField(
+        required=False,
+        description="Verify IMAP server certificate",
+        default=True,
+        category=FieldCategory.CONNECTIVITY,
+    )
     # Ingestion fields
     folder: str = AssetField(
         required=True,
@@ -747,16 +910,16 @@ class ImapHelper:
         is_oauth = self.asset.auth_type == "OAuth"
         use_ssl = self.asset.use_ssl
         server = self.asset.server
+        ssl_context = _create_ssl_context(self.asset.verify_server_cert)
 
         socket.setdefaulttimeout(timeout)
 
         try:
             if is_oauth or use_ssl:
-                self._imap_conn = imaplib.IMAP4_SSL(server)
+                self._imap_conn = imaplib.IMAP4_SSL(server, ssl_context=ssl_context)
             else:
                 self._imap_conn = imaplib.IMAP4(server)
-                with contextlib.suppress(Exception):
-                    self._imap_conn.starttls()
+                self._imap_conn.starttls(ssl_context=ssl_context)
         except Exception as e:
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(IMAP_ERROR_CONNECTING_TO_SERVER, e)
@@ -816,7 +979,7 @@ class ImapHelper:
         self._folder_name = self.asset.folder
         try:
             result, _ = self._imap_conn.select(
-                f'"{imap_utf7.encode(self._folder_name).decode()}"', read_only
+                _quote_mailbox(self._folder_name), read_only
             )
         except Exception as e:
             raise Exception(
@@ -834,11 +997,10 @@ class ImapHelper:
 
     def _get_email_data(self, muuid, folder=None, is_diff=False):
         """Get email data from IMAP server"""
+        muuid = _validate_imap_uid(muuid)
         if is_diff and folder:
             try:
-                result, data = self._imap_conn.select(
-                    f'"{imap_utf7.encode(folder).decode()}"', True
-                )
+                result, data = self._imap_conn.select(_quote_mailbox(folder), True)
             except Exception as e:
                 raise Exception(
                     IMAP_GENERAL_ERROR_MESSAGE.format(
@@ -854,10 +1016,6 @@ class ImapHelper:
         try:
             (result, data) = self._imap_conn.uid(
                 "fetch", muuid, "(INTERNALDATE RFC822)"
-            )
-        except TypeError:
-            (result, data) = self._imap_conn.uid(
-                "fetch", str(muuid), "(INTERNALDATE RFC822)"
             )
         except Exception as e:
             raise Exception(IMAP_FETCH_ID_FAILED.format(muuid=muuid, excep=e)) from e
@@ -914,10 +1072,10 @@ class ImapHelper:
         else:
             return uids[:max_emails]
 
-    def _parse_and_create_artifacts(
+    def _parse_email(
         self, email_id, email_data, data_time_info, asset, config=None
-    ):
-        """Parse email and yield Container and Artifacts for ingestion using SDK EmailProcessor"""
+    ) -> ParsedEmail:
+        """Parse an email and retain files until the caller vaults them."""
         epoch = int(time.mktime(datetime.now(tz=UTC).timetuple())) * 1000
 
         if data_time_info:
@@ -952,19 +1110,21 @@ class ImapHelper:
             email_data, str(email_id), epoch
         )
 
-        if not ret_val:
-            logger.error(f"Failed to process email {email_id}: {message}")
-            return
+        if not ret_val or not results or not results[0].get("container"):
+            email_processor._del_tmp_dirs()
+            raise ActionFailure(f"Failed to process email {email_id}: {message}")
 
-        for result in results:
-            container_dict = result.get("container")
-            if container_dict:
-                yield Container(**container_dict)
-
-            artifacts = result.get("artifacts", [])
-            for artifact_dict in artifacts:
-                if artifact_dict:
-                    yield Artifact(**artifact_dict)
+        result = results[0]
+        return ParsedEmail(
+            container=Container(**result["container"]),
+            artifacts=[
+                Artifact(**artifact_dict)
+                for artifact_dict in result.get("artifacts", [])
+                if artifact_dict
+            ],
+            files=list(result.get("files", [])),
+            processor=email_processor,
+        )
 
 
 @app.test_connectivity()
@@ -1056,29 +1216,68 @@ def on_poll(
         lower_id = state.get("next_muid", 1)
         max_emails = asset.first_run_max_emails if is_first_run else asset.max_emails
 
-    email_ids = helper._get_email_ids_to_process(
+    new_email_ids = helper._get_email_ids_to_process(
         max_emails, lower_id, asset.ingest_manner
+    )
+    email_ids = (
+        new_email_ids
+        if is_poll_now
+        else _email_ids_for_poll(
+            new_email_ids,
+            state.get("failed_muid_retries", {}),
+            asset.ingest_manner,
+        )
     )
 
     if not email_ids:
         logger.info("No new emails to ingest")
         return
 
+    failed_ids: list[int] = []
     for email_id in email_ids:
         try:
             email_data, data_time_info = helper._get_email_data(email_id)
-
-            yield from helper._parse_and_create_artifacts(
-                email_id, email_data, data_time_info, asset
-            )
+            parsed = helper._parse_email(email_id, email_data, data_time_info, asset)
+            try:
+                yield parsed.container
+                if parsed.container.container_id is None:
+                    raise ActionFailure(f"Container was not saved for email {email_id}")
+                yield from parsed.artifacts
+                for file_data in parsed.files:
+                    yield _build_vault_artifact(
+                        PhantomVault(soar),
+                        file_data,
+                        int(parsed.container.container_id),
+                    )
+            finally:
+                parsed.cleanup()
 
         except Exception as e:
             logger.error(f"Error processing email {email_id}: {e}")
+            failed_ids.append(int(email_id))
             continue
 
     if email_ids and not is_poll_now:
-        state["next_muid"] = int(email_ids[-1]) + 1
+        high_water, retry_counts, exhausted_ids = _next_email_poll_state(
+            lower_id,
+            new_email_ids,
+            failed_ids,
+            state.get("failed_muid_retries", {}),
+        )
+        state["next_muid"] = high_water
+        state["failed_muid_retries"] = retry_counts
         state["first_run"] = False
+        if failed_ids:
+            retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))
+            message = f"Email processing failed for UIDs {sorted(failed_ids)}."
+            if retryable_ids:
+                message += f" Retrying UIDs {retryable_ids} on the next poll."
+            if exhausted_ids:
+                message += (
+                    f" Skipping UIDs {sorted(exhausted_ids)} after "
+                    f"{_MAX_EMAIL_PROCESSING_ATTEMPTS} failed attempts."
+                )
+            soar.set_message(message)
 
 
 @app.on_es_poll()
@@ -1100,14 +1299,24 @@ def on_es_poll(
     else:
         max_emails = asset.max_emails
 
-    email_ids = helper._get_email_ids_to_process(
+    new_email_ids = helper._get_email_ids_to_process(
         max_emails, lower_id, asset.ingest_manner
+    )
+    email_ids = (
+        new_email_ids
+        if is_poll_now
+        else _email_ids_for_poll(
+            new_email_ids,
+            state.get("es_failed_muid_retries", {}),
+            asset.ingest_manner,
+        )
     )
 
     if not email_ids:
         logger.info("No new emails to ingest for ES")
         return
 
+    failed_ids: list[int] = []
     for email_id in email_ids:
         try:
             raw_email, _data_time_info = helper._get_email_data(email_id)
@@ -1116,13 +1325,33 @@ def on_es_poll(
             )
         except Exception as e:
             logger.error(f"Error processing email {email_id} for ES: {e}")
+            failed_ids.append(int(email_id))
             continue
 
         finding = _build_finding_from_email(str(email_id), raw_email, outer_data)
 
-        state["es_next_muid"] = int(email_id) + 1
-
         yield finding
+
+    if email_ids and not is_poll_now:
+        high_water, retry_counts, exhausted_ids = _next_email_poll_state(
+            lower_id,
+            new_email_ids,
+            failed_ids,
+            state.get("es_failed_muid_retries", {}),
+        )
+        state["es_next_muid"] = high_water
+        state["es_failed_muid_retries"] = retry_counts
+        if failed_ids:
+            retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))
+            message = f"ES email processing failed for UIDs {sorted(failed_ids)}."
+            if retryable_ids:
+                message += f" Retrying UIDs {retryable_ids} on the next poll."
+            if exhausted_ids:
+                message += (
+                    f" Skipping UIDs {sorted(exhausted_ids)} after "
+                    f"{_MAX_EMAIL_PROCESSING_ATTEMPTS} failed attempts."
+                )
+            soar.set_message(message)
 
 
 class ImapMakeRequestParams(MakeRequestParams):
@@ -1272,12 +1501,12 @@ class GetEmailParams(Params):
         cef_types=["imap email id"],
         default="",
     )
-    container_id: str = Param(
+    container_id: int | None = Param(
         description="Container ID to get email data from",
         required=False,
         primary=True,
         cef_types=["phantom container id"],
-        default="",
+        default=None,
     )
     folder: str = Param(
         description="Folder name of email to get(used when id is given as input)",
@@ -1400,6 +1629,7 @@ class GetEmailOutput(ActionOutput):
 @app.action(
     description="Get an email from the server or container",
     action_type="investigate",
+    read_only=False,
     verbose='Every container that is created by the IMAP app has the following values:<ul><li>The container ID, that is generated by the Phantom platform.</li><li>The Source ID that the app equates to the email ID along with the hash of the folder name on the remote server</li><li>The raw_email data in the container\'s data field is set to the RFC822 format of the email.</li></ul>This action parses email data and if specified, creates containers and artifacts. The email data to parse is either extracted from the remote server if an email <b>id</b> is specified along with its folder name or from a Phantom container if the <b>contianer_id</b> is specified. The folder parameter is used only when the email id is specified in the input. If the folder is not mentioned, it takes the folder name from the asset configuration parameter. If the folder name is not specified as an input of the \\"get email\\" action or in asset configuration parameters, \\"inbox\\" is taken as its value.<br>If both parameters are specified, the action will use the <b>container_id</b>.<br>Do note that any containers and artifacts created will use the label configured in the asset.',
 )
 def get_email(params: GetEmailParams, soar: SOARClient, asset: Asset) -> GetEmailOutput:
@@ -1449,31 +1679,31 @@ def get_email(params: GetEmailParams, soar: SOARClient, asset: Asset) -> GetEmai
                 "extract_urls": True,
             }
 
-            containers_and_artifacts = list(
-                helper._parse_and_create_artifacts(
-                    params.id, email_data, data_time_info, asset, config=config
-                )
+            parsed = helper._parse_email(
+                params.id, email_data, data_time_info, asset, config=config
             )
+            try:
+                ret_val, message, container_id = app.actions_manager.save_container(
+                    parsed.container.to_dict()
+                )
+                if not ret_val or not container_id:
+                    raise ActionFailure(f"Failed to save email container: {message}")
 
-            for obj in containers_and_artifacts:
-                if isinstance(obj, Container):
-                    container_dict = obj.to_dict()
-                    ret_val, message, cid = app.actions_manager.save_container(
-                        container_dict
-                    )
-                    if ret_val:
-                        container_id = cid
-                    break
-
-            if container_id:
                 artifacts_to_save = []
-                for obj in containers_and_artifacts:
-                    if isinstance(obj, Artifact):
-                        artifact_dict = obj.to_dict()
-                        artifact_dict["container_id"] = container_id
-                        artifacts_to_save.append(artifact_dict)
+                for artifact in parsed.artifacts:
+                    artifact.container_id = container_id
+                    artifacts_to_save.append(artifact.to_dict())
+                vault = PhantomVault(soar)
+                for file_data in parsed.files:
+                    artifacts_to_save.append(
+                        _build_vault_artifact(
+                            vault, file_data, int(container_id)
+                        ).to_dict()
+                    )
                 if artifacts_to_save:
                     app.actions_manager.save_artifacts(artifacts_to_save)
+            finally:
+                parsed.cleanup()
 
             message = f"Email ingested with container ID: {container_id}"
             soar.set_summary(GetEmailSummary(container_id=container_id))
@@ -1490,11 +1720,9 @@ def get_email(params: GetEmailParams, soar: SOARClient, asset: Asset) -> GetEmai
         return GetEmailOutput(**ret_val)
 
     if params.container_id:
-        container = soar.get_container(params.container_id)
-        if not container:
+        container = soar.get(f"/rest/container/{params.container_id}").json()
+        if not isinstance(container, dict) or not container:
             raise ValueError(f"Container with ID {params.container_id} not found")
-
-        soar.get_container_artifacts(params.container_id)
 
         ret_val = {}
 
