@@ -138,26 +138,38 @@ def _quote_mailbox(folder: str) -> str:
     return f'"{escaped}"'
 
 
-def _next_email_checkpoint(
-    email_ids: list[int],
+def _email_ids_for_poll(
+    new_email_ids: list[int],
+    retry_counts: dict[str, int],
+    manner: str,
+) -> list[int]:
+    """Combine newly selected UIDs with every pending retry UID."""
+    email_ids = set(new_email_ids)
+    email_ids.update(int(email_id) for email_id in retry_counts)
+    return sorted(email_ids, reverse=manner == "latest first")
+
+
+def _next_email_poll_state(
+    current_high_water: int,
+    new_email_ids: list[int],
     failed_ids: list[int],
     retry_counts: dict[str, int],
 ) -> tuple[int, dict[str, int], list[int]]:
-    """Advance after successes while retrying each failed UID a bounded number of times."""
+    """Advance the high-water mark and independently retain bounded retries."""
     updated_counts: dict[str, int] = {}
-    retryable_ids: list[int] = []
     exhausted_ids: list[int] = []
 
-    for email_id in failed_ids:
+    for email_id in sorted(set(failed_ids)):
         attempts = int(retry_counts.get(str(email_id), 0)) + 1
         if attempts < _MAX_EMAIL_PROCESSING_ATTEMPTS:
             updated_counts[str(email_id)] = attempts
-            retryable_ids.append(email_id)
         else:
             exhausted_ids.append(email_id)
 
-    checkpoint = min(retryable_ids) if retryable_ids else int(email_ids[-1]) + 1
-    return checkpoint, updated_counts, exhausted_ids
+    high_water = int(current_high_water)
+    if new_email_ids:
+        high_water = max(high_water, max(new_email_ids) + 1)
+    return high_water, updated_counts, exhausted_ids
 
 
 @dataclass
@@ -1204,8 +1216,17 @@ def on_poll(
         lower_id = state.get("next_muid", 1)
         max_emails = asset.first_run_max_emails if is_first_run else asset.max_emails
 
-    email_ids = helper._get_email_ids_to_process(
+    new_email_ids = helper._get_email_ids_to_process(
         max_emails, lower_id, asset.ingest_manner
+    )
+    email_ids = (
+        new_email_ids
+        if is_poll_now
+        else _email_ids_for_poll(
+            new_email_ids,
+            state.get("failed_muid_retries", {}),
+            asset.ingest_manner,
+        )
     )
 
     if not email_ids:
@@ -1237,12 +1258,13 @@ def on_poll(
             continue
 
     if email_ids and not is_poll_now:
-        checkpoint, retry_counts, exhausted_ids = _next_email_checkpoint(
-            email_ids,
+        high_water, retry_counts, exhausted_ids = _next_email_poll_state(
+            lower_id,
+            new_email_ids,
             failed_ids,
             state.get("failed_muid_retries", {}),
         )
-        state["next_muid"] = checkpoint
+        state["next_muid"] = high_water
         state["failed_muid_retries"] = retry_counts
         state["first_run"] = False
         if failed_ids:
@@ -1277,8 +1299,17 @@ def on_es_poll(
     else:
         max_emails = asset.max_emails
 
-    email_ids = helper._get_email_ids_to_process(
+    new_email_ids = helper._get_email_ids_to_process(
         max_emails, lower_id, asset.ingest_manner
+    )
+    email_ids = (
+        new_email_ids
+        if is_poll_now
+        else _email_ids_for_poll(
+            new_email_ids,
+            state.get("es_failed_muid_retries", {}),
+            asset.ingest_manner,
+        )
     )
 
     if not email_ids:
@@ -1302,12 +1333,13 @@ def on_es_poll(
         yield finding
 
     if email_ids and not is_poll_now:
-        checkpoint, retry_counts, exhausted_ids = _next_email_checkpoint(
-            email_ids,
+        high_water, retry_counts, exhausted_ids = _next_email_poll_state(
+            lower_id,
+            new_email_ids,
             failed_ids,
             state.get("es_failed_muid_retries", {}),
         )
-        state["es_next_muid"] = checkpoint
+        state["es_next_muid"] = high_water
         state["es_failed_muid_retries"] = retry_counts
         if failed_ids:
             retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))

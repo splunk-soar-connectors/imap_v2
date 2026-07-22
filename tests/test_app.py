@@ -88,25 +88,40 @@ def test_get_email_is_not_read_only():
     assert imap_app.get_email.meta.read_only is False
 
 
-def test_checkpoint_retries_failed_email_without_blocking_forever():
-    checkpoint, retry_counts, exhausted = imap_app._next_email_checkpoint(
-        [10, 11, 12], [11], {}
+def test_oldest_first_retry_does_not_reselect_later_successes():
+    first_batch = imap_app._email_ids_for_poll([10, 11, 12], {}, "oldest first")
+    high_water, retry_counts, exhausted = imap_app._next_email_poll_state(
+        10, first_batch, [10], {}
     )
-    assert (checkpoint, retry_counts, exhausted) == (11, {"11": 1}, [])
+    assert (high_water, retry_counts, exhausted) == (13, {"10": 1}, [])
 
-    checkpoint, retry_counts, exhausted = imap_app._next_email_checkpoint(
-        [11, 12, 13], [11], {"11": 1}
+    next_batch = imap_app._email_ids_for_poll([13], retry_counts, "oldest first")
+    assert next_batch == [10, 13]
+    assert 11 not in next_batch
+    assert 12 not in next_batch
+
+
+def test_latest_first_includes_pending_retry_beyond_new_email_limit():
+    new_email_ids = [106, 107, 108, 109, 110]
+
+    email_ids = imap_app._email_ids_for_poll(new_email_ids, {"10": 1}, "latest first")
+    assert email_ids == [110, 109, 108, 107, 106, 10]
+
+
+def test_successful_retry_is_removed_without_moving_high_water_backward():
+    assert imap_app._next_email_poll_state(111, [], [], {"10": 1}) == (
+        111,
+        {},
+        [],
     )
-    assert (checkpoint, retry_counts, exhausted) == (11, {"11": 2}, [])
 
-    checkpoint, retry_counts, exhausted = imap_app._next_email_checkpoint(
-        [11, 12, 13], [11], {"11": 2}
+
+def test_exhausted_retry_is_removed_without_moving_high_water_backward():
+    assert imap_app._next_email_poll_state(111, [], [10], {"10": 2}) == (
+        111,
+        {},
+        [10],
     )
-    assert (checkpoint, retry_counts, exhausted) == (14, {}, [11])
-
-
-def test_checkpoint_advances_after_success():
-    assert imap_app._next_email_checkpoint([10, 11, 12], [], {}) == (13, {}, [])
 
 
 @pytest.mark.parametrize("value", ["1/artifacts", "\uff11"])
