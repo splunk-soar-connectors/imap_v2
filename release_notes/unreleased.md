@@ -1,3 +1,1 @@
 **Unreleased**
-
-* Updated the Splunk SOAR SDK to version 3.26.3 to harden shared email parsing, body extraction, and persistence error handling.
