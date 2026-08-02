@@ -108,6 +108,35 @@ def test_latest_first_includes_pending_retry_beyond_new_email_limit():
     assert email_ids == [110, 109, 108, 107, 106, 10]
 
 
+def test_latest_first_returns_overflow_for_later_poll_windows():
+    helper = imap_app.ImapHelper(MagicMock(), _asset())
+    helper._imap_conn = MagicMock()
+    helper._imap_conn.uid.return_value = (
+        "OK",
+        [b"101 102 103 104 105 106"],
+    )
+
+    selected, overflow = helper._get_email_ids_to_process(2, 101, "latest first")
+
+    assert selected == [105, 106]
+    assert overflow == [101, 102, 103, 104]
+
+
+def test_oldest_first_leaves_overflow_discoverable_by_high_water():
+    helper = imap_app.ImapHelper(MagicMock(), _asset())
+    helper._imap_conn = MagicMock()
+    helper._imap_conn.uid.return_value = (
+        "OK",
+        [b"101 102 103 104"],
+    )
+
+    selected, overflow = helper._get_email_ids_to_process(2, 101, "oldest first")
+
+    assert selected == [101, 102]
+    assert overflow == []
+    assert imap_app._next_email_poll_state(101, selected, [], {})[0] == 103
+
+
 def test_successful_retry_is_removed_without_moving_high_water_backward():
     assert imap_app._next_email_poll_state(111, [], [], {"10": 1}) == (
         111,
