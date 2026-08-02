@@ -302,20 +302,15 @@ def _build_reporter(outer: EmailData, email_id: str) -> FindingEmailReporter | N
 
 def _find_forwarded_attachment(
     outer_data: EmailData, raw_email: str
-) -> tuple[bytes, str, int | None] | None:
+) -> tuple[bytes, str, int | None, list[tuple[bytes, str]]] | None:
     """Find a forwarded .eml/.msg attachment in the email.
 
     Checks both parsed attachments and raw MIME parts (for message/rfc822
     parts that the SDK parser does not extract as attachments).
     """
-    for index, att in enumerate(outer_data.attachments):
-        if att.content and _is_forwarded_email_attachment(
-            att.filename, att.content_type
-        ):
-            return att.content, att.filename, index
-
     # The SDK skips message/rfc822 MIME parts during attachment extraction,
-    # so scan the raw message directly for embedded email parts.
+    # so collect every attached embedded message from the raw MIME tree.
+    raw_forwarded_attachments: list[tuple[bytes, str]] = []
     mail = email.message_from_string(raw_email)
     for part in mail.walk():
         if (
@@ -324,10 +319,25 @@ def _find_forwarded_attachment(
         ):
             payload = part.get_payload()
             if isinstance(payload, list) and payload:
-                inner_msg = payload[0]
-                inner_bytes = inner_msg.as_bytes()
                 filename = part.get_filename() or "forwarded.eml"
-                return inner_bytes, filename, None
+                raw_forwarded_attachments.extend(
+                    (inner_msg.as_bytes(), filename) for inner_msg in payload
+                )
+
+    for index, att in enumerate(outer_data.attachments):
+        if att.content and _is_forwarded_email_attachment(
+            att.filename, att.content_type
+        ):
+            return (
+                att.content,
+                att.filename,
+                index,
+                raw_forwarded_attachments,
+            )
+
+    if raw_forwarded_attachments:
+        content, filename = raw_forwarded_attachments[0]
+        return content, filename, None, raw_forwarded_attachments[1:]
     return None
 
 
@@ -338,7 +348,12 @@ def _build_finding_from_email(
     forwarded = _find_forwarded_attachment(outer_data, raw_email)
 
     if forwarded:
-        content, filename, selected_outer_attachment_index = forwarded
+        (
+            content,
+            filename,
+            selected_outer_attachment_index,
+            unselected_raw_attachments,
+        ) = forwarded
         inner_data = _parse_attached_email(content, email_id)
         if inner_data:
             return _build_forwarded_finding(
@@ -349,6 +364,7 @@ def _build_finding_from_email(
                 outer_data,
                 inner_data,
                 selected_outer_attachment_index,
+                unselected_raw_attachments,
             )
         logger.warning(
             "Failed to parse forwarded attachment %s, treating as normal email",
@@ -555,6 +571,7 @@ def _build_forwarded_finding(
     outer_data: EmailData,
     inner_data: EmailData,
     selected_outer_attachment_index: int | None = None,
+    unselected_raw_attachments: list[tuple[bytes, str]] | None = None,
 ) -> Finding:
     """Build a Finding that keeps the untrusted outer message authoritative."""
     body_text = outer_data.body.plain_text or outer_data.body.html or ""
@@ -591,6 +608,15 @@ def _build_forwarded_finding(
                     is_raw_email=False,
                 )
             )
+
+    for content, filename in unselected_raw_attachments or []:
+        attachments.append(
+            FindingAttachment(
+                file_name=filename,
+                data=content,
+                is_raw_email=True,
+            )
+        )
 
     urls = list(dict.fromkeys([*inner_data.urls, *outer_data.urls]))
 
