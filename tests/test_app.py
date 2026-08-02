@@ -162,7 +162,10 @@ def test_invalid_container_id_is_rejected_by_sdk_params(value):
 def test_forwarded_finding_preserves_outer_evidence():
     outer = EmailData(
         raw_email="From: reporter@example.com\r\n\r\nouter",
-        headers=EmailHeaders(from_address="reporter@example.com"),
+        headers=EmailHeaders(
+            from_address="reporter@example.com",
+            subject="Outer report subject",
+        ),
         body=EmailBody(plain_text="outer"),
         urls=["https://outer.example/phish"],
         attachments=[
@@ -175,7 +178,10 @@ def test_forwarded_finding_preserves_outer_evidence():
     )
     inner = EmailData(
         raw_email="From: sender@example.com\r\n\r\ninner",
-        headers=EmailHeaders(from_address="sender@example.com"),
+        headers=EmailHeaders(
+            from_address="sender@example.com",
+            subject="Inner decoy subject",
+        ),
         body=EmailBody(plain_text="inner"),
         urls=["https://inner.example/message"],
     )
@@ -198,6 +204,54 @@ def test_forwarded_finding_preserves_outer_evidence():
         "email_42.eml",
         "payload.bin",
     }
+    assert finding.email.body == "outer"
+    assert finding.email.headers["subject"] == "Outer report subject"
+    assert "Outer report subject" in finding.rule_title
+    assert "Inner decoy subject" not in finding.rule_title
+
+
+def test_forwarded_finding_preserves_other_forwarded_and_same_name_attachments():
+    selected = EmailAttachment(
+        filename="forwarded.eml",
+        content_type="message/rfc822",
+        content=b"selected",
+    )
+    same_name = EmailAttachment(
+        filename="forwarded.eml",
+        content_type="message/rfc822",
+        content=b"different",
+    )
+    other_forwarded = EmailAttachment(
+        filename="other.msg",
+        content_type="application/vnd.ms-outlook",
+        content=b"other",
+    )
+    outer = EmailData(
+        raw_email="From: reporter@example.com\r\n\r\nouter",
+        headers=EmailHeaders(from_address="reporter@example.com"),
+        body=EmailBody(plain_text="outer"),
+        attachments=[selected, same_name, other_forwarded],
+    )
+    inner = EmailData(
+        raw_email="From: sender@example.com\r\n\r\ninner",
+        headers=EmailHeaders(from_address="sender@example.com"),
+        body=EmailBody(plain_text="inner"),
+    )
+
+    finding = imap_app._build_forwarded_finding(
+        "42",
+        outer.raw_email,
+        selected.content,
+        selected.filename,
+        outer,
+        inner,
+        selected_outer_attachment_index=0,
+    )
+
+    payloads = [attachment.data for attachment in finding.attachments]
+    assert payloads.count(b"selected") == 1
+    assert b"different" in payloads
+    assert b"other" in payloads
 
 
 def test_inline_rfc822_part_does_not_reclassify_outer_email():
