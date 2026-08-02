@@ -11,6 +11,7 @@
 # either express or implied. See the License for the specific language governing permissions
 # and limitations under the License.
 
+from email.message import EmailMessage
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -274,6 +275,39 @@ benign
 """
 
     assert imap_app._find_forwarded_attachment(outer, raw_email) is None
+
+
+def test_multiple_raw_rfc822_attachments_are_preserved_discretely():
+    outer_message = EmailMessage()
+    outer_message["From"] = "reporter@example.com"
+    outer_message["Subject"] = "Outer report"
+    outer_message.set_content("outer")
+
+    for filename, subject in (
+        ("first.eml", "First attached message"),
+        ("second.eml", "Second attached message"),
+    ):
+        inner_message = EmailMessage()
+        inner_message["From"] = "sender@example.com"
+        inner_message["Subject"] = subject
+        inner_message.set_content("inner")
+        outer_message.add_attachment(inner_message, filename=filename)
+
+    raw_email = outer_message.as_string()
+    outer_data = imap_app.extract_email_data(
+        raw_email,
+        "42",
+        include_attachment_content=True,
+    )
+
+    finding = imap_app._build_finding_from_email("42", raw_email, outer_data)
+
+    raw_attachment_names = [
+        attachment.file_name
+        for attachment in finding.attachments
+        if attachment.is_raw_email
+    ]
+    assert raw_attachment_names == ["first.eml", "email_42.eml", "second.eml"]
 
 
 def test_build_vault_artifact_adds_hashes(tmp_path):
