@@ -1047,7 +1047,7 @@ class ImapHelper:
         return email_data, data_time_info
 
     def _get_email_ids_to_process(self, max_emails, lower_id, manner):
-        """Get list of email UIDs to process based on ingestion manner"""
+        """Return selected email UIDs and any latest-first overflow."""
         try:
             result, data = self._imap_conn.uid("search", None, f"UID {lower_id!s}:*")
         except Exception as e:
@@ -1057,20 +1057,19 @@ class ImapHelper:
             raise Exception(f"Failed to get email IDs. Server response: {data}")
 
         if not data or not data[0]:
-            return []
+            return [], []
 
         uids = [int(uid) for uid in data[0].split()]
 
         if len(uids) == 1 and uids[0] < lower_id:
-            return []
+            return [], []
 
         uids.sort()
         max_emails = int(max_emails)
 
         if manner == "latest first":
-            return uids[-max_emails:]
-        else:
-            return uids[:max_emails]
+            return uids[-max_emails:], uids[:-max_emails]
+        return uids[:max_emails], []
 
     def _parse_email(
         self, email_id, email_data, data_time_info, asset, config=None
@@ -1216,9 +1215,21 @@ def on_poll(
         lower_id = state.get("next_muid", 1)
         max_emails = asset.first_run_max_emails if is_first_run else asset.max_emails
 
-    new_email_ids = helper._get_email_ids_to_process(
-        max_emails, lower_id, asset.ingest_manner
-    )
+    pending_key = "pending_email_uids"
+    pending_ids = [int(email_id) for email_id in state.get(pending_key, [])]
+    if not is_poll_now and asset.ingest_manner == "latest first" and pending_ids:
+        new_email_ids = pending_ids[-max_emails:]
+        remaining_ids = pending_ids[:-max_emails]
+        if remaining_ids:
+            state[pending_key] = remaining_ids
+        else:
+            state.pop(pending_key, None)
+    else:
+        new_email_ids, overflow_ids = helper._get_email_ids_to_process(
+            max_emails, lower_id, asset.ingest_manner
+        )
+        if not is_poll_now and overflow_ids:
+            state[pending_key] = overflow_ids
     email_ids = (
         new_email_ids
         if is_poll_now
@@ -1299,9 +1310,21 @@ def on_es_poll(
     else:
         max_emails = asset.max_emails
 
-    new_email_ids = helper._get_email_ids_to_process(
-        max_emails, lower_id, asset.ingest_manner
-    )
+    pending_key = "es_pending_email_uids"
+    pending_ids = [int(email_id) for email_id in state.get(pending_key, [])]
+    if not is_poll_now and asset.ingest_manner == "latest first" and pending_ids:
+        new_email_ids = pending_ids[-max_emails:]
+        remaining_ids = pending_ids[:-max_emails]
+        if remaining_ids:
+            state[pending_key] = remaining_ids
+        else:
+            state.pop(pending_key, None)
+    else:
+        new_email_ids, overflow_ids = helper._get_email_ids_to_process(
+            max_emails, lower_id, asset.ingest_manner
+        )
+        if not is_poll_now and overflow_ids:
+            state[pending_key] = overflow_ids
     email_ids = (
         new_email_ids
         if is_poll_now
