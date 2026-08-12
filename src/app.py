@@ -302,20 +302,15 @@ def _build_reporter(outer: EmailData, email_id: str) -> FindingEmailReporter | N
 
 def _find_forwarded_attachment(
     outer_data: EmailData, raw_email: str
-) -> tuple[bytes, str] | None:
+) -> tuple[bytes, str, int | None, list[tuple[bytes, str]]] | None:
     """Find a forwarded .eml/.msg attachment in the email.
 
     Checks both parsed attachments and raw MIME parts (for message/rfc822
     parts that the SDK parser does not extract as attachments).
     """
-    for att in outer_data.attachments:
-        if att.content and _is_forwarded_email_attachment(
-            att.filename, att.content_type
-        ):
-            return att.content, att.filename
-
     # The SDK skips message/rfc822 MIME parts during attachment extraction,
-    # so scan the raw message directly for embedded email parts.
+    # so collect every attached embedded message from the raw MIME tree.
+    raw_forwarded_attachments: list[tuple[bytes, str]] = []
     mail = email.message_from_string(raw_email)
     for part in mail.walk():
         if (
@@ -324,10 +319,25 @@ def _find_forwarded_attachment(
         ):
             payload = part.get_payload()
             if isinstance(payload, list) and payload:
-                inner_msg = payload[0]
-                inner_bytes = inner_msg.as_bytes()
                 filename = part.get_filename() or "forwarded.eml"
-                return inner_bytes, filename
+                raw_forwarded_attachments.extend(
+                    (inner_msg.as_bytes(), filename) for inner_msg in payload
+                )
+
+    for index, att in enumerate(outer_data.attachments):
+        if att.content and _is_forwarded_email_attachment(
+            att.filename, att.content_type
+        ):
+            return (
+                att.content,
+                att.filename,
+                index,
+                raw_forwarded_attachments,
+            )
+
+    if raw_forwarded_attachments:
+        content, filename = raw_forwarded_attachments[0]
+        return content, filename, None, raw_forwarded_attachments[1:]
     return None
 
 
@@ -338,7 +348,12 @@ def _build_finding_from_email(
     forwarded = _find_forwarded_attachment(outer_data, raw_email)
 
     if forwarded:
-        content, filename = forwarded
+        (
+            content,
+            filename,
+            selected_outer_attachment_index,
+            unselected_raw_attachments,
+        ) = forwarded
         inner_data = _parse_attached_email(content, email_id)
         if inner_data:
             return _build_forwarded_finding(
@@ -348,6 +363,8 @@ def _build_finding_from_email(
                 filename,
                 outer_data,
                 inner_data,
+                selected_outer_attachment_index,
+                unselected_raw_attachments,
             )
         logger.warning(
             "Failed to parse forwarded attachment %s, treating as normal email",
@@ -553,10 +570,12 @@ def _build_forwarded_finding(
     inner_filename: str,
     outer_data: EmailData,
     inner_data: EmailData,
+    selected_outer_attachment_index: int | None = None,
+    unselected_raw_attachments: list[tuple[bytes, str]] | None = None,
 ) -> Finding:
-    """Build a Finding where the reported/inner email is the target and the outer is the reporter."""
-    body_text = inner_data.body.plain_text or inner_data.body.html or ""
-    email_headers = {k: v for k, v in inner_data.to_dict()["headers"].items() if v}
+    """Build a Finding that keeps the untrusted outer message authoritative."""
+    body_text = outer_data.body.plain_text or outer_data.body.html or ""
+    email_headers = {k: v for k, v in outer_data.to_dict()["headers"].items() if v}
 
     attachments: list[FindingAttachment] = [
         FindingAttachment(
@@ -580,12 +599,8 @@ def _build_forwarded_finding(
                 )
             )
 
-    for att in outer_data.attachments:
-        if (
-            att.content
-            and att.filename != inner_filename
-            and not _is_forwarded_email_attachment(att.filename, att.content_type)
-        ):
+    for index, att in enumerate(outer_data.attachments):
+        if att.content and index != selected_outer_attachment_index:
             attachments.append(
                 FindingAttachment(
                     file_name=att.filename,
@@ -594,10 +609,19 @@ def _build_forwarded_finding(
                 )
             )
 
+    for content, filename in unselected_raw_attachments or []:
+        attachments.append(
+            FindingAttachment(
+                file_name=filename,
+                data=content,
+                is_raw_email=True,
+            )
+        )
+
     urls = list(dict.fromkeys([*inner_data.urls, *outer_data.urls]))
 
     return Finding(
-        rule_title=_build_forwarded_title(outer_data, inner_data),
+        rule_title=_build_direct_title(outer_data),
         email=FindingEmail(
             headers=email_headers or None,
             body=body_text or None,
@@ -1047,7 +1071,7 @@ class ImapHelper:
         return email_data, data_time_info
 
     def _get_email_ids_to_process(self, max_emails, lower_id, manner):
-        """Get list of email UIDs to process based on ingestion manner"""
+        """Return selected email UIDs and any latest-first overflow."""
         try:
             result, data = self._imap_conn.uid("search", None, f"UID {lower_id!s}:*")
         except Exception as e:
@@ -1057,20 +1081,19 @@ class ImapHelper:
             raise Exception(f"Failed to get email IDs. Server response: {data}")
 
         if not data or not data[0]:
-            return []
+            return [], []
 
         uids = [int(uid) for uid in data[0].split()]
 
         if len(uids) == 1 and uids[0] < lower_id:
-            return []
+            return [], []
 
         uids.sort()
         max_emails = int(max_emails)
 
         if manner == "latest first":
-            return uids[-max_emails:]
-        else:
-            return uids[:max_emails]
+            return uids[-max_emails:], uids[:-max_emails]
+        return uids[:max_emails], []
 
     def _parse_email(
         self, email_id, email_data, data_time_info, asset, config=None
@@ -1216,9 +1239,21 @@ def on_poll(
         lower_id = state.get("next_muid", 1)
         max_emails = asset.first_run_max_emails if is_first_run else asset.max_emails
 
-    new_email_ids = helper._get_email_ids_to_process(
-        max_emails, lower_id, asset.ingest_manner
-    )
+    pending_key = "pending_email_uids"
+    pending_ids = [int(email_id) for email_id in state.get(pending_key, [])]
+    if not is_poll_now and asset.ingest_manner == "latest first" and pending_ids:
+        new_email_ids = pending_ids[-max_emails:]
+        remaining_ids = pending_ids[:-max_emails]
+        if remaining_ids:
+            state[pending_key] = remaining_ids
+        else:
+            state.pop(pending_key, None)
+    else:
+        new_email_ids, overflow_ids = helper._get_email_ids_to_process(
+            max_emails, lower_id, asset.ingest_manner
+        )
+        if not is_poll_now and overflow_ids:
+            state[pending_key] = overflow_ids
     email_ids = (
         new_email_ids
         if is_poll_now
@@ -1299,9 +1334,21 @@ def on_es_poll(
     else:
         max_emails = asset.max_emails
 
-    new_email_ids = helper._get_email_ids_to_process(
-        max_emails, lower_id, asset.ingest_manner
-    )
+    pending_key = "es_pending_email_uids"
+    pending_ids = [int(email_id) for email_id in state.get(pending_key, [])]
+    if not is_poll_now and asset.ingest_manner == "latest first" and pending_ids:
+        new_email_ids = pending_ids[-max_emails:]
+        remaining_ids = pending_ids[:-max_emails]
+        if remaining_ids:
+            state[pending_key] = remaining_ids
+        else:
+            state.pop(pending_key, None)
+    else:
+        new_email_ids, overflow_ids = helper._get_email_ids_to_process(
+            max_emails, lower_id, asset.ingest_manner
+        )
+        if not is_poll_now and overflow_ids:
+            state[pending_key] = overflow_ids
     email_ids = (
         new_email_ids
         if is_poll_now
@@ -1502,7 +1549,11 @@ class GetEmailParams(Params):
         default="",
     )
     container_id: int | None = Param(
-        description="Container ID to get email data from",
+        description=(
+            "Container ID to get email data from. This lookup uses the connector "
+            "automation account and can read any container available to that account; "
+            "it does not apply the initiating user's label or ownership scope."
+        ),
         required=False,
         primary=True,
         cef_types=["phantom container id"],
@@ -1630,7 +1681,7 @@ class GetEmailOutput(ActionOutput):
     description="Get an email from the server or container",
     action_type="investigate",
     read_only=False,
-    verbose='Every container that is created by the IMAP app has the following values:<ul><li>The container ID, that is generated by the Phantom platform.</li><li>The Source ID that the app equates to the email ID along with the hash of the folder name on the remote server</li><li>The raw_email data in the container\'s data field is set to the RFC822 format of the email.</li></ul>This action parses email data and if specified, creates containers and artifacts. The email data to parse is either extracted from the remote server if an email <b>id</b> is specified along with its folder name or from a Phantom container if the <b>contianer_id</b> is specified. The folder parameter is used only when the email id is specified in the input. If the folder is not mentioned, it takes the folder name from the asset configuration parameter. If the folder name is not specified as an input of the \\"get email\\" action or in asset configuration parameters, \\"inbox\\" is taken as its value.<br>If both parameters are specified, the action will use the <b>container_id</b>.<br>Do note that any containers and artifacts created will use the label configured in the asset.',
+    verbose='Every container that is created by the IMAP app has the following values:<ul><li>The container ID, that is generated by the Phantom platform.</li><li>The Source ID that the app equates to the email ID along with the hash of the folder name on the remote server</li><li>The raw_email data in the container\'s data field is set to the RFC822 format of the email.</li></ul>This action parses email data and if specified, creates containers and artifacts. The email data to parse is either extracted from the remote server if an email <b>id</b> is specified along with its folder name or from a Phantom container if the <b>container_id</b> is specified. Container lookup uses the connector automation account and can read any container available to that account; it does not apply the initiating user\'s label or ownership scope. The folder parameter is used only when the email id is specified in the input. If the folder is not mentioned, it takes the folder name from the asset configuration parameter. If the folder name is not specified as an input of the \\"get email\\" action or in asset configuration parameters, \\"inbox\\" is taken as its value.<br>If both parameters are specified, the action will use the <b>container_id</b>.<br>Do note that any containers and artifacts created will use the label configured in the asset.',
 )
 def get_email(params: GetEmailParams, soar: SOARClient, asset: Asset) -> GetEmailOutput:
     """Get an email from the server or container"""

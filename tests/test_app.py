@@ -11,6 +11,7 @@
 # either express or implied. See the License for the specific language governing permissions
 # and limitations under the License.
 
+from email.message import EmailMessage
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -108,6 +109,35 @@ def test_latest_first_includes_pending_retry_beyond_new_email_limit():
     assert email_ids == [110, 109, 108, 107, 106, 10]
 
 
+def test_latest_first_returns_overflow_for_later_poll_windows():
+    helper = imap_app.ImapHelper(MagicMock(), _asset())
+    helper._imap_conn = MagicMock()
+    helper._imap_conn.uid.return_value = (
+        "OK",
+        [b"101 102 103 104 105 106"],
+    )
+
+    selected, overflow = helper._get_email_ids_to_process(2, 101, "latest first")
+
+    assert selected == [105, 106]
+    assert overflow == [101, 102, 103, 104]
+
+
+def test_oldest_first_leaves_overflow_discoverable_by_high_water():
+    helper = imap_app.ImapHelper(MagicMock(), _asset())
+    helper._imap_conn = MagicMock()
+    helper._imap_conn.uid.return_value = (
+        "OK",
+        [b"101 102 103 104"],
+    )
+
+    selected, overflow = helper._get_email_ids_to_process(2, 101, "oldest first")
+
+    assert selected == [101, 102]
+    assert overflow == []
+    assert imap_app._next_email_poll_state(101, selected, [], {})[0] == 103
+
+
 def test_successful_retry_is_removed_without_moving_high_water_backward():
     assert imap_app._next_email_poll_state(111, [], [], {"10": 1}) == (
         111,
@@ -133,7 +163,10 @@ def test_invalid_container_id_is_rejected_by_sdk_params(value):
 def test_forwarded_finding_preserves_outer_evidence():
     outer = EmailData(
         raw_email="From: reporter@example.com\r\n\r\nouter",
-        headers=EmailHeaders(from_address="reporter@example.com"),
+        headers=EmailHeaders(
+            from_address="reporter@example.com",
+            subject="Outer report subject",
+        ),
         body=EmailBody(plain_text="outer"),
         urls=["https://outer.example/phish"],
         attachments=[
@@ -146,7 +179,10 @@ def test_forwarded_finding_preserves_outer_evidence():
     )
     inner = EmailData(
         raw_email="From: sender@example.com\r\n\r\ninner",
-        headers=EmailHeaders(from_address="sender@example.com"),
+        headers=EmailHeaders(
+            from_address="sender@example.com",
+            subject="Inner decoy subject",
+        ),
         body=EmailBody(plain_text="inner"),
         urls=["https://inner.example/message"],
     )
@@ -169,6 +205,54 @@ def test_forwarded_finding_preserves_outer_evidence():
         "email_42.eml",
         "payload.bin",
     }
+    assert finding.email.body == "outer"
+    assert finding.email.headers["subject"] == "Outer report subject"
+    assert "Outer report subject" in finding.rule_title
+    assert "Inner decoy subject" not in finding.rule_title
+
+
+def test_forwarded_finding_preserves_other_forwarded_and_same_name_attachments():
+    selected = EmailAttachment(
+        filename="forwarded.eml",
+        content_type="message/rfc822",
+        content=b"selected",
+    )
+    same_name = EmailAttachment(
+        filename="forwarded.eml",
+        content_type="message/rfc822",
+        content=b"different",
+    )
+    other_forwarded = EmailAttachment(
+        filename="other.msg",
+        content_type="application/vnd.ms-outlook",
+        content=b"other",
+    )
+    outer = EmailData(
+        raw_email="From: reporter@example.com\r\n\r\nouter",
+        headers=EmailHeaders(from_address="reporter@example.com"),
+        body=EmailBody(plain_text="outer"),
+        attachments=[selected, same_name, other_forwarded],
+    )
+    inner = EmailData(
+        raw_email="From: sender@example.com\r\n\r\ninner",
+        headers=EmailHeaders(from_address="sender@example.com"),
+        body=EmailBody(plain_text="inner"),
+    )
+
+    finding = imap_app._build_forwarded_finding(
+        "42",
+        outer.raw_email,
+        selected.content,
+        selected.filename,
+        outer,
+        inner,
+        selected_outer_attachment_index=0,
+    )
+
+    payloads = [attachment.data for attachment in finding.attachments]
+    assert payloads.count(b"selected") == 1
+    assert b"different" in payloads
+    assert b"other" in payloads
 
 
 def test_inline_rfc822_part_does_not_reclassify_outer_email():
@@ -191,6 +275,39 @@ benign
 """
 
     assert imap_app._find_forwarded_attachment(outer, raw_email) is None
+
+
+def test_multiple_raw_rfc822_attachments_are_preserved_discretely():
+    outer_message = EmailMessage()
+    outer_message["From"] = "reporter@example.com"
+    outer_message["Subject"] = "Outer report"
+    outer_message.set_content("outer")
+
+    for filename, subject in (
+        ("first.eml", "First attached message"),
+        ("second.eml", "Second attached message"),
+    ):
+        inner_message = EmailMessage()
+        inner_message["From"] = "sender@example.com"
+        inner_message["Subject"] = subject
+        inner_message.set_content("inner")
+        outer_message.add_attachment(inner_message, filename=filename)
+
+    raw_email = outer_message.as_string()
+    outer_data = imap_app.extract_email_data(
+        raw_email,
+        "42",
+        include_attachment_content=True,
+    )
+
+    finding = imap_app._build_finding_from_email("42", raw_email, outer_data)
+
+    raw_attachment_names = [
+        attachment.file_name
+        for attachment in finding.attachments
+        if attachment.is_raw_email
+    ]
+    assert raw_attachment_names == ["first.eml", "email_42.eml", "second.eml"]
 
 
 def test_build_vault_artifact_adds_hashes(tmp_path):
