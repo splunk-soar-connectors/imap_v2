@@ -71,18 +71,48 @@ def test_ssl_connection_uses_validating_context(mocker):
 
 @pytest.mark.parametrize(
     "value",
-    ["1\r\nA001 DELETE INBOX", "0", "-1", "\uff11\uff12"],
+    [
+        "1\r\nA001 DELETE INBOX",
+        "0",
+        "01",
+        "-1",
+        "4294967296",
+        "\uff11\uff12",
+    ],
 )
 def test_invalid_email_id_is_rejected(value):
     with pytest.raises(ValueError, match="Email ID"):
         imap_app._validate_imap_uid(value)
 
 
+@pytest.mark.parametrize("value", ["1", 1, "4294967295"])
+def test_valid_email_id_is_preserved(value):
+    assert imap_app._validate_imap_uid(value) == str(value)
+
+
 def test_mailbox_name_is_quoted_and_line_breaks_are_rejected():
     assert imap_app._quote_mailbox('folder "name"') == '"folder \\"name\\""'
+    assert imap_app._quote_mailbox("folder\\name") == '"folder\\\\name"'
 
     with pytest.raises(ValueError, match="line breaks"):
         imap_app._quote_mailbox("INBOX\r\nA001 DELETE INBOX")
+
+
+def test_get_email_params_reject_invalid_imap_values():
+    with pytest.raises(ValidationError, match="Email ID"):
+        imap_app.GetEmailParams(id="1\r\nA001 DELETE INBOX")
+
+    with pytest.raises(ValidationError, match="line breaks"):
+        imap_app.GetEmailParams(folder="INBOX\r\nA001 DELETE INBOX")
+
+
+def test_asset_rejects_mailbox_line_breaks():
+    with pytest.raises(ValidationError, match="line breaks"):
+        imap_app.Asset(
+            server="mail.example.com",
+            username="user",
+            folder="INBOX\r\nA001 DELETE INBOX",
+        )
 
 
 def test_get_email_is_not_read_only():
