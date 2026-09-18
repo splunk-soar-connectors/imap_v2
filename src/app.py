@@ -26,7 +26,7 @@ from email.header import decode_header, make_header
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
 
-from pydantic import Field as PydanticField
+from pydantic import Field as PydanticField, field_validator
 
 from dateutil import tz
 from imapclient import imap_utf7
@@ -122,7 +122,7 @@ def _create_ssl_context(verify_server_cert: bool) -> ssl.SSLContext:
 
 def _validate_imap_uid(value: str | int) -> str:
     uid = str(value)
-    if not uid.isascii() or not uid.isdecimal():
+    if not uid.isascii() or not uid.isdecimal() or uid.startswith("0"):
         raise ValueError("Email ID must be a positive integer")
     numeric_uid = int(uid)
     if not 0 < numeric_uid <= _MAX_IMAP_UID:
@@ -130,10 +130,14 @@ def _validate_imap_uid(value: str | int) -> str:
     return uid
 
 
-def _quote_mailbox(folder: str) -> str:
+def _validate_mailbox(folder: str) -> str:
     if "\r" in folder or "\n" in folder:
         raise ValueError("Folder must not contain line breaks")
-    encoded = imap_utf7.encode(folder).decode()
+    return folder
+
+
+def _quote_mailbox(folder: str) -> str:
+    encoded = imap_utf7.encode(_validate_mailbox(folder)).decode()
     escaped = encoded.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
@@ -808,6 +812,11 @@ class Asset(BaseAsset):
         default=False,
         category=FieldCategory.INGEST,
     )
+
+    @field_validator("folder")
+    @classmethod
+    def validate_folder(cls, folder: str) -> str:
+        return _validate_mailbox(folder)
 
 
 app = App(
@@ -1567,6 +1576,16 @@ class GetEmailParams(Params):
     ingest_email: bool = Param(
         description="Create container and artifacts", required=False, default=False
     )
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, email_id: str) -> str:
+        return _validate_imap_uid(email_id) if email_id else email_id
+
+    @field_validator("folder")
+    @classmethod
+    def validate_folder(cls, folder: str) -> str:
+        return _validate_mailbox(folder)
 
 
 class GetEmailOutput(ActionOutput):
