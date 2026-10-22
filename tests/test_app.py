@@ -75,6 +75,16 @@ def test_ssl_connection_uses_validating_context(mocker):
     ssl_connection.assert_called_once_with("mail.example.com", ssl_context=context)
 
 
+def test_validating_context_uses_runtime_ca_bundle(mocker, monkeypatch):
+    context = MagicMock()
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/splunk/broker/etc/cacerts.pem")
+    create_context = mocker.patch.object(imap_app.ssl, "create_default_context", return_value=context)
+
+    assert imap_app._create_ssl_context(True) is context
+
+    create_context.assert_called_once_with(cafile="/splunk/broker/etc/cacerts.pem")
+
+
 @pytest.mark.parametrize(
     "value",
     [

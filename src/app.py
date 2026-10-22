@@ -15,6 +15,7 @@ import email
 import hashlib
 import imaplib
 import json
+import os
 import shlex
 import socket
 import ssl
@@ -103,16 +104,14 @@ _READ_ONLY_IMAP_COMMANDS = {
     "UID",
 }
 _READ_ONLY_UID_COMMANDS = {"FETCH", "SEARCH", "SORT", "THREAD"}
-_SOAR_CA_BUNDLE = Path("/opt/phantom/etc/cacerts.pem")
 _MAX_IMAP_UID = 4_294_967_295
 _MAX_EMAIL_PROCESSING_ATTEMPTS = 3
 
 
 def _create_ssl_context(verify_server_cert: bool) -> ssl.SSLContext:
-    context = ssl.create_default_context()
+    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE")
+    context = ssl.create_default_context(cafile=ca_bundle)
     if verify_server_cert:
-        if _SOAR_CA_BUNDLE.is_file():
-            context.load_verify_locations(cafile=str(_SOAR_CA_BUNDLE))
         return context
 
     context.check_hostname = False
