@@ -1126,6 +1126,12 @@ class ImapHelper:
                 "extract_ips": asset.extract_ips,
                 "extract_urls": asset.extract_urls,
             }
+        else:
+            config = dict(config)
+
+        config.setdefault(
+            "add_body_to_header_artifacts", asset.add_body_to_header_artifacts
+        )
 
         context = ProcessEmailContext(
             soar=self.soar,

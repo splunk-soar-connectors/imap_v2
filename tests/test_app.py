@@ -36,6 +36,12 @@ def _asset(**overrides):
         "password": None,
         "folder": "INBOX",
         "verify_server_cert": True,
+        "extract_attachments": True,
+        "extract_urls": True,
+        "extract_ips": True,
+        "extract_domains": True,
+        "extract_hashes": True,
+        "add_body_to_header_artifacts": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -117,6 +123,48 @@ def test_asset_rejects_mailbox_line_breaks():
 
 def test_get_email_is_not_read_only():
     assert imap_app.get_email.meta.read_only is False
+
+
+@pytest.mark.parametrize("with_explicit_config", [False, True])
+@pytest.mark.parametrize("add_body_to_header_artifacts", [False, True])
+def test_parse_email_obeys_body_asset_setting(
+    with_explicit_config, add_body_to_header_artifacts
+):
+    body = "UNIQUE_BODY_REPRO_38515"
+    email_data = (
+        "From: sender@example.com\r\n"
+        "To: recipient@example.com\r\n"
+        "Subject: body extraction regression\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        f"\r\n{body}"
+    )
+    asset = _asset(add_body_to_header_artifacts=add_body_to_header_artifacts)
+    helper = imap_app.ImapHelper(MagicMock(), asset)
+    helper._folder_name = "INBOX"
+    config = None
+    if with_explicit_config:
+        # get email supplies an explicit extraction config of its own.
+        config = {
+            "extract_attachments": True,
+            "extract_domains": True,
+            "extract_hashes": True,
+            "extract_ips": True,
+            "extract_urls": True,
+        }
+
+    parsed = helper._parse_email("1", email_data, None, asset, config=config)
+    try:
+        email_artifact = next(
+            artifact
+            for artifact in parsed.artifacts
+            if artifact.name == "Email Artifact"
+        )
+        if add_body_to_header_artifacts:
+            assert email_artifact.cef["bodyPart1"] == body
+        else:
+            assert "bodyPart1" not in email_artifact.cef
+    finally:
+        parsed.cleanup()
 
 
 def test_oldest_first_retry_does_not_reselect_later_successes():
