@@ -251,9 +251,99 @@ def test_imap_poll_reports_partial_failures_without_linking_failed_inputs(
         assert [
             entry["filename"] for entry in context.payloads[0]["email"]["attachments"]
         ] == ["email_1.eml"]
-    assert context.state["ingest"]["es_next_muid"] == 4
+    assert context.state.get("ingest", {}).get("es_next_muid", 1) == 1
     assert all(not path.exists() for path in context.paths)
     assert_secret_free(caplog.text)
+
+
+@pytest.mark.parametrize("manner", ["oldest first", "latest first"])
+def test_failed_batch_replays_without_repeating_checkpointed_emails(
+    poll_runtime, manner
+):
+    context = poll_runtime
+    imap_app.app.asset.ingest_manner = manner
+    context.helper._get_email_ids_to_process.side_effect = lambda limit, lower, order: (
+        list(range(lower, 26)),
+        [],
+    )
+    context.reject_finding = 12
+
+    assert imap_app.on_es_poll(OnESPollParams())
+    assert result().get_summary()["created"] == 19
+    assert result().get_summary()["failed"] == 1
+    first_batch = (
+        list(range(1, 11)) if manner == "oldest first" else list(range(25, 15, -1))
+    )
+    failed_batch = (
+        list(range(11, 21)) if manner == "oldest first" else list(range(15, 5, -1))
+    )
+    assert [p["rule_title"] for p in context.payloads] == [
+        f"sender@example.com reported email - Reported mail {uid}"
+        for uid in first_batch + failed_batch
+    ]
+    checkpoint = context.state["ingest"]
+    assert checkpoint["es_next_muid"] == (11 if manner == "oldest first" else 26)
+    if manner == "latest first":
+        assert checkpoint["es_pending_email_uids"] == list(range(1, 16))
+
+    context.reject_finding = None
+    count = len(context.payloads)
+    assert imap_app.on_es_poll(OnESPollParams())
+    remaining = (
+        list(range(11, 26)) if manner == "oldest first" else list(range(15, 0, -1))
+    )
+    assert [p["rule_title"] for p in context.payloads[count:]] == [
+        f"sender@example.com reported email - Reported mail {uid}" for uid in remaining
+    ]
+    assert context.state["ingest"]["es_next_muid"] == 26
+    assert not context.state["ingest"].get("es_pending_email_uids")
+
+
+def test_checkpoint_preserves_unprocessed_email_retries(poll_runtime, monkeypatch):
+    context = poll_runtime
+    state = imap_app.app.asset.ingest_state
+    state.put_all({"es_next_muid": 100, "es_failed_muid_retries": {"1": 1, "2": 1}})
+    context.helper._get_email_ids_to_process.return_value = ([100], [])
+    monkeypatch.setattr(imap_app.app.soar_client, "MAX_BULK_FINDINGS", 1)
+    context.reject_finding = 2
+
+    assert imap_app.on_es_poll(OnESPollParams())
+    assert state["es_next_muid"] == 100
+    assert state["es_failed_muid_retries"] == {"2": 1}
+
+
+@pytest.mark.parametrize("attempts", [0, 2])
+def test_processing_failure_is_counted_once_across_batch_checkpoints(
+    poll_runtime,
+    monkeypatch,
+    attempts,
+):
+    context = poll_runtime
+    state = imap_app.app.asset.ingest_state
+    state.put_all({"es_failed_muid_retries": {"1": attempts}})
+    context.helper._get_email_ids_to_process.return_value = ([1, 2, 3], [])
+
+    def read(uid):
+        if uid == 1:
+            raise RuntimeError("Email unavailable")
+        return email_message(uid), None
+
+    context.helper._get_email_data.side_effect = read
+    monkeypatch.setattr(imap_app.app.soar_client, "MAX_BULK_FINDINGS", 1)
+    assert imap_app.on_es_poll(OnESPollParams())
+    assert state["es_next_muid"] == 4
+    assert state["es_failed_muid_retries"] == ({"1": 1} if attempts == 0 else {})
+
+
+def test_manual_poll_does_not_advance_scheduled_checkpoint(poll_runtime):
+    context = poll_runtime
+    state = imap_app.app.asset.ingest_state
+    original = {"es_next_muid": 100, "es_failed_muid_retries": {"1": 1}}
+    state.put_all(original)
+    context.helper._get_email_ids_to_process.return_value = ([100, 101], [])
+    assert imap_app.on_es_poll(OnESPollParams(container_count=1))
+    assert state.get_all() == original
+    assert result().get_summary()["created"] == 1
 
 
 def assert_secret_free(logs):

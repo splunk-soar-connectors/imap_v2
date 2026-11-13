@@ -29,7 +29,7 @@ version number; this is a development build, not the published SDK release with
 that number. The resulting TGZ can be shared directly for testing, including
 changes that have not yet been pushed to the SDK branch.
 
-The six cases in `tests/test_es_poll_sdk.py` must pass with the preview wheel.
+The cases in `tests/test_es_poll_sdk.py` must pass with the preview wheel.
 They skip when using a released SDK that lacks the new execution-context hook.
 They exercise the real IMAP polling handler, email parsing, SDK finding
 serialization and result handling. IMAP, upload transport, ES HTTP responses and
@@ -59,7 +59,13 @@ Use a test mailbox with plain emails, ordinary attachments and forwarded `.eml`
 messages. Invoke semantic `on_es_poll`, then inspect the action result's finding
 IDs and attachment upload/link outcomes. Confirm each finding references its own
 uploaded files and that Timeline eventually stores its associations. Include a
-finding failure and an upload failure; later findings should still be processed.
+finding failure and an upload failure. A finding creation failure finishes the
+current batch and stops polling; the next scheduled poll replays that batch.
+Previously checkpointed batches must not repeat. Successful findings within a
+failed batch can be duplicated. Upload failures alone do not replay findings.
+
+The connector stages its cursor before yielding each finding. Latest-first polls
+also retain unprocessed UIDs so a checkpoint cannot skip older selected emails.
 
 The attachment reference URI is temporary. SAA requires the companion `app-ess`
 reader update. Browser download support and the race between finding creation
