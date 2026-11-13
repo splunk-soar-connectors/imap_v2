@@ -1379,7 +1379,11 @@ def on_es_poll(
         return
 
     failed_ids: list[int] = []
+    processed_ids: set[int] = set()
+    retry_counts = state.get("es_failed_muid_retries", {})
+    pending_ids = list(state.get(pending_key, []))
     for email_id in email_ids:
+        finding = None
         try:
             raw_email, _data_time_info = helper._get_email_data(email_id)
             outer_data = extract_email_data(
@@ -1388,32 +1392,51 @@ def on_es_poll(
         except Exception as e:
             logger.error(f"Error processing email {email_id} for ES: {e}")
             failed_ids.append(int(email_id))
-            continue
+        else:
+            finding = _build_finding_from_email(str(email_id), raw_email, outer_data)
 
-        finding = _build_finding_from_email(str(email_id), raw_email, outer_data)
-
-        yield finding
-
-    if email_ids and not is_poll_now:
-        high_water, retry_counts, exhausted_ids = _next_email_poll_state(
-            lower_id,
-            new_email_ids,
-            failed_ids,
-            state.get("es_failed_muid_retries", {}),
-        )
-        state["es_next_muid"] = high_water
-        state["es_failed_muid_retries"] = retry_counts
-        if failed_ids:
-            retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))
-            message = f"ES email processing failed for UIDs {sorted(failed_ids)}."
-            if retryable_ids:
-                message += f" Retrying UIDs {retryable_ids} on the next poll."
-            if exhausted_ids:
-                message += (
-                    f" Skipping UIDs {sorted(exhausted_ids)} after "
-                    f"{_MAX_EMAIL_PROCESSING_ATTEMPTS} failed attempts."
+        if not is_poll_now:
+            processed_ids.add(int(email_id))
+            high_water, updated_retries, exhausted_ids = _next_email_poll_state(
+                lower_id,
+                [uid for uid in new_email_ids if uid in processed_ids],
+                failed_ids,
+                retry_counts,
+            )
+            # Keep retries and latest-first UIDs outside the checkpointed batch.
+            updated_retries.update(
+                {
+                    uid: attempts
+                    for uid, attempts in retry_counts.items()
+                    if int(uid) not in processed_ids
+                }
+            )
+            state["es_next_muid"] = high_water
+            state["es_failed_muid_retries"] = updated_retries
+            if asset.ingest_manner == "latest first":
+                pending = sorted(
+                    set(pending_ids) | (set(new_email_ids) - processed_ids)
                 )
-            soar.set_message(message)
+                if pending:
+                    state[pending_key] = pending
+                else:
+                    state.pop(pending_key, None)
+
+        # Stage the cursor before yielding so the SDK can checkpoint each batch.
+        if finding is not None:
+            yield finding
+
+    if not is_poll_now and failed_ids:
+        retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))
+        message = f"ES email processing failed for UIDs {sorted(failed_ids)}."
+        if retryable_ids:
+            message += f" Retrying UIDs {retryable_ids} on the next poll."
+        if exhausted_ids:
+            message += (
+                f" Skipping UIDs {sorted(exhausted_ids)} after "
+                f"{_MAX_EMAIL_PROCESSING_ATTEMPTS} failed attempts."
+            )
+        soar.set_message(message)
 
 
 class ImapMakeRequestParams(MakeRequestParams):
