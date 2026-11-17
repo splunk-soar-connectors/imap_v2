@@ -11,7 +11,7 @@
 # CONDITIONS OF ANY KIND, either express or implied. See the License for the
 # specific language governing permissions and limitations under the License.
 
-"""Exercise IMAP's real polling handler with the SDK under review."""
+"""Exercise IMAP's real polling handler with the released SDK."""
 
 import json
 import sys
@@ -23,18 +23,12 @@ from uuid import UUID
 import httpx
 import pytest
 from soar_sdk.asset_state import AssetState
+from soar_sdk.exceptions import AttachmentUploadError
+from soar_sdk.models.attachment_upload import AttachmentUploadResult
 from soar_sdk.params import OnESPollParams
 
 from src import app as imap_app
 
-pytestmark = pytest.mark.skipif(
-    not hasattr(imap_app.app.soar_client, "_get_es_finding_context"),
-    reason="Run with the AR-2061 SDK wheel; see TESTING_ES_POLL.md.",
-)
-
-if hasattr(imap_app.app.soar_client, "_get_es_finding_context"):
-    from soar_sdk.exceptions import AttachmentUploadError
-    from soar_sdk.models.attachment_upload import AttachmentUploadResult
 
 ES_URL = "https://es.example:8089"
 ES_TOKEN = "test-es-token-never-exposed"
@@ -44,6 +38,7 @@ FILE_CONTENT = b"test-file-content-never-exposed"
 @pytest.fixture
 def poll_runtime(monkeypatch, mocker):
     app = imap_app.app
+    mocker.patch("soar_sdk.decorators._es_poll.sleep")
     asset = imap_app.Asset(server="imap.example", username="test-user")
     state = {}
     mocker.patch.object(app.actions_manager, "load_state", side_effect=state.copy)
@@ -142,7 +137,11 @@ def poll_runtime(monkeypatch, mocker):
         context.events.append("create")
         context.payloads.append(payload)
         index = len(context.payloads)
-        if index == context.reject_finding:
+        if (
+            context.reject_finding
+            and len(context.payloads) >= context.reject_finding
+            and payload == context.payloads[context.reject_finding - 1]
+        ):
             return httpx.Response(503, text=ES_TOKEN)
         return httpx.Response(
             201, json={"_time": "now", "finding_id": f"finding-{index}"}
@@ -279,7 +278,7 @@ def test_failed_batch_replays_without_repeating_checkpointed_emails(
     )
     assert [p["rule_title"] for p in context.payloads] == [
         f"sender@example.com reported email - Reported mail {uid}"
-        for uid in first_batch + failed_batch
+        for uid in first_batch + failed_batch + [failed_batch[1]] * 2
     ]
     checkpoint = context.state["ingest"]
     assert checkpoint["es_next_muid"] == (11 if manner == "oldest first" else 26)
