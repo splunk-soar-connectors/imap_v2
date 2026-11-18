@@ -14,6 +14,7 @@
 import email
 import hashlib
 import imaplib
+import re
 import json
 import shlex
 import socket
@@ -26,11 +27,13 @@ from email.header import decode_header, make_header
 from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from pathlib import Path
 
-from pydantic import Field as PydanticField, field_validator
+from pydantic import Field as PydanticField, ValidationError, field_validator
 
 from dateutil import tz
 from imapclient import imap_utf7
 from parse import parse
+from logging import DEBUG, Filter, LogRecord, getLogger as get_standard_logger
+
 from soar_sdk.abstract import SOARClient
 from soar_sdk.action_results import ActionOutput, OutputField
 from soar_sdk.app import App
@@ -84,6 +87,155 @@ from .imap_consts import (
 IMAP_APP_ID = "69a0cc22-227b-4ecf-bf9d-443cabe870a0"
 
 logger = getLogger()
+
+
+class _EmailParserLogFilter(Filter):
+    """Keep released SDK parser debug events without echoing message data."""
+
+    def filter(self, record: LogRecord) -> bool:
+        source = record.pathname.replace("\\", "/")
+        parser_event = record.levelno == DEBUG and source.endswith(
+            (
+                "/soar_sdk/extras/email/utils.py",
+                "/soar_sdk/extras/email/email_data.py",
+            )
+        )
+        http_event = (
+            record.name == "httpx"
+            and isinstance(record.msg, str)
+            and record.msg.startswith("HTTP Request:")
+        )
+        if parser_event or http_event:
+            args = record.args
+            record.msg = (
+                "SDK email parser debug event; message details omitted"
+                if parser_event
+                else "HTTP request completed; URL omitted"
+            )
+            record.args = ()
+            if http_event and isinstance(args, tuple) and len(args) >= 4:
+                method, status = args[0], args[3]
+                if (
+                    isinstance(method, str)
+                    and method
+                    in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+                    and type(status) is int
+                    and 100 <= status <= 599
+                ):
+                    record.msg = "%s request returned HTTP %s; URL omitted"
+                    record.args = (method, status)
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+
+logger.addFilter(_EmailParserLogFilter())
+get_standard_logger("httpx").addFilter(_EmailParserLogFilter())
+
+
+def _email_failure_reason(error: Exception) -> str:
+    """Describe a failure using only allowlisted metadata, never exception text."""
+    kind = type(error).__name__
+    status = next(
+        (
+            value
+            for value in (
+                getattr(error, "status_code", None),
+                getattr(getattr(error, "response", None), "status_code", None),
+                getattr(getattr(error, "resp", None), "status", None),
+            )
+            if type(value) is int and 100 <= value <= 599
+        ),
+        None,
+    )
+    if status is None:
+        # Graph wraps HTTP failures in ActionFailure. Read only its fixed status
+        # prefix; never include the response body or remainder of the message.
+        match = re.match(
+            r"(?:API Error|Error|Empty response with status) ([1-5][0-9]{2})(?::|$)",
+            str(error),
+        )
+        if match:
+            status = int(match[1])
+    if status is not None:
+        reason = {
+            400: "invalid_request",
+            401: "authentication",
+            403: "permission_denied",
+            404: "not_found",
+            410: "gone",
+            413: "payload_too_large",
+            422: "invalid_data",
+            429: "rate_limited",
+        }.get(status, "service_unavailable" if status >= 500 else "http_error")
+        return f"HTTP {status} {reason} ({kind})"
+    if isinstance(error, ValidationError):
+        issue = error.errors(
+            include_input=False, include_context=False, include_url=False
+        )[0]
+        field = next(iter(issue["loc"]), "payload")
+        if field not in {
+            "rule_title",
+            "email",
+            "attachments",
+            "headers",
+            "urls",
+            "raw_email_link",
+            "file_name",
+            "data",
+            "severity",
+            "urgency",
+            "finding_source",
+            "security_domain",
+        }:
+            field = "payload"
+        rule = issue["type"]
+        if rule not in {
+            "missing",
+            "string_type",
+            "string_too_long",
+            "string_too_short",
+            "int_parsing",
+            "bool_parsing",
+            "url_parsing",
+            "list_type",
+            "dict_type",
+            "value_error",
+            "bytes_type",
+            "literal_error",
+            "extra_forbidden",
+        }:
+            rule = "invalid_value"
+        return f"validation field={field} rule={rule}"
+    if kind in {
+        "TimeoutError",
+        "Timeout",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+    }:
+        reason = "timeout"
+    elif kind in {"SSLError", "SSLCertVerificationError", "CertificateError"}:
+        reason = "tls_error"
+    elif isinstance(error, ConnectionError) or kind in {
+        "ConnectError",
+        "gaierror",
+        "IMAP4.abort",
+        "abort",
+    }:
+        reason = "connection_failed"
+    elif isinstance(error, UnicodeError) or type(error).__module__ == "binascii":
+        reason = "invalid_encoding"
+    elif kind == "JSONDecodeError":
+        reason = "invalid_json"
+    elif isinstance(error, (ValueError, TypeError)):
+        reason = "invalid_data"
+    else:
+        reason = "processing_failed"
+    return f"{reason} ({kind})"
+
 
 _EML_CONTENT_TYPES = {"message/rfc822"}
 _READ_ONLY_HTTP_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -371,8 +523,7 @@ def _build_finding_from_email(
                 unselected_raw_attachments,
             )
         logger.warning(
-            "Failed to parse forwarded attachment %s, treating as normal email",
-            filename,
+            "Forwarded email attachment could not be parsed; using outer email",
         )
 
     return _build_direct_finding(email_id, raw_email, outer_data)
@@ -990,7 +1141,10 @@ class ImapHelper:
                             read_only=read_only,
                         )
                 except Exception as refresh_error:
-                    logger.error(f"OAuth token refresh failed: {refresh_error}")
+                    logger.error(
+                        "OAuth token refresh failed: %s",
+                        _email_failure_reason(refresh_error),
+                    )
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(IMAP_ERROR_LOGGING_IN_TO_SERVER, e)
             ) from None
@@ -1384,26 +1538,33 @@ def on_es_poll(
     pending_ids = list(state.get(pending_key, []))
     for email_id in email_ids:
         finding = None
+        stage = "fetch"
         try:
             raw_email, _data_time_info = helper._get_email_data(email_id)
+            stage = "parse"
             outer_data = extract_email_data(
                 raw_email, str(email_id), include_attachment_content=True
             )
-        except Exception as e:
-            logger.error(f"Error processing email {email_id} for ES: {e}")
-            failed_ids.append(int(email_id))
-        else:
+            stage = "build"
             finding = _build_finding_from_email(str(email_id), raw_email, outer_data)
+        except Exception as error:
+            logger.warning(
+                "Skipping ES email UID %s at %s: %s",
+                email_id,
+                stage,
+                _email_failure_reason(error),
+            )
+            failed_ids.append(int(email_id))
 
         if not is_poll_now:
             processed_ids.add(int(email_id))
-            high_water, updated_retries, exhausted_ids = _next_email_poll_state(
+            high_water, updated_retries, _ = _next_email_poll_state(
                 lower_id,
                 [uid for uid in new_email_ids if uid in processed_ids],
-                failed_ids,
+                [],
                 retry_counts,
             )
-            # Keep retries and latest-first UIDs outside the checkpointed batch.
+            # Preserve legacy retry IDs that have not been attempted in this batch.
             updated_retries.update(
                 {
                     uid: attempts
@@ -1426,17 +1587,10 @@ def on_es_poll(
         if finding is not None:
             yield finding
 
-    if not is_poll_now and failed_ids:
-        retryable_ids = sorted(set(failed_ids) - set(exhausted_ids))
-        message = f"ES email processing failed for UIDs {sorted(failed_ids)}."
-        if retryable_ids:
-            message += f" Retrying UIDs {retryable_ids} on the next poll."
-        if exhausted_ids:
-            message += (
-                f" Skipping UIDs {sorted(exhausted_ids)} after "
-                f"{_MAX_EMAIL_PROCESSING_ATTEMPTS} failed attempts."
-            )
-        soar.set_message(message)
+    if failed_ids:
+        soar.set_message(
+            f"Skipped {len(failed_ids)} email(s) after processing failures."
+        )
 
 
 class ImapMakeRequestParams(MakeRequestParams):

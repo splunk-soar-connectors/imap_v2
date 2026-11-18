@@ -1,9 +1,7 @@
 # Testing IMAP ES polling
 
-The connector requires the published Splunk SOAR SDK 7.2.1 or later. The commands
+The connector requires published Splunk SOAR SDK 7.2.2 or later. The commands
 below use the released version pinned in `uv.lock`.
-
-## Build and test
 
 ```sh
 uv run --frozen --python 3.13 pytest -q
@@ -40,9 +38,9 @@ messages. Invoke semantic `on_es_poll`, then inspect the action result's finding
 IDs and attachment upload/link outcomes. Confirm each finding references its own
 uploaded files and that Timeline eventually stores its associations. Include a
 finding failure and an upload failure. A finding creation failure finishes the
-current batch and stops polling; the next scheduled poll replays that batch.
-Previously checkpointed batches must not repeat. Successful findings within a
-failed batch can be duplicated. Upload failures alone do not replay findings.
+current batch, skips the failed email and continues to later messages. The
+next scheduled poll must not replay processed messages. Timeouts during bounded
+SDK retries can still create duplicates. Upload failures alone do not replay findings.
 
 The connector stages its cursor before yielding each finding. Latest-first polls
 also retain unprocessed UIDs so a checkpoint cannot skip older selected emails.
@@ -54,3 +52,13 @@ with automatic threat analysis and automation disabled; enable them only when
 testing that readiness behavior. A `queued` association result confirms enqueueing,
 not completed persistence. Local tests do not establish live ES, S3 or Timeline
 readiness.
+
+Individual failed emails are skipped with their ID and error category in warning
+logs, without message contents or upstream error text. Skipped messages are not
+automatically replayed, so data can be lost; this change adds no dead letter
+queue. Source failures before a message can be identified still stop polling.
+
+Connector-local log filters redact released SDK parser debug details and HTTPX
+request URLs while retaining debug events and HTTP methods/statuses. SDK source
+is unchanged. Regression tests exercise real parser logging and HTTPX request
+logging with simulated secrets at DEBUG/INFO levels.

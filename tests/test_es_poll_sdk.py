@@ -11,7 +11,7 @@
 # CONDITIONS OF ANY KIND, either express or implied. See the License for the
 # specific language governing permissions and limitations under the License.
 
-"""Exercise IMAP's real polling handler with the released SDK."""
+"""Exercise IMAP's real polling handler with the pinned SDK checkpoint fix."""
 
 import json
 import sys
@@ -250,15 +250,13 @@ def test_imap_poll_reports_partial_failures_without_linking_failed_inputs(
         assert [
             entry["filename"] for entry in context.payloads[0]["email"]["attachments"]
         ] == ["email_1.eml"]
-    assert context.state.get("ingest", {}).get("es_next_muid", 1) == 1
+    assert context.state.get("ingest", {}).get("es_next_muid", 1) == 4
     assert all(not path.exists() for path in context.paths)
     assert_secret_free(caplog.text)
 
 
 @pytest.mark.parametrize("manner", ["oldest first", "latest first"])
-def test_failed_batch_replays_without_repeating_checkpointed_emails(
-    poll_runtime, manner
-):
+def test_failed_email_is_skipped_without_replaying_processed_mail(poll_runtime, manner):
     context = poll_runtime
     imap_app.app.asset.ingest_manner = manner
     context.helper._get_email_ids_to_process.side_effect = lambda limit, lower, order: (
@@ -268,7 +266,7 @@ def test_failed_batch_replays_without_repeating_checkpointed_emails(
     context.reject_finding = 12
 
     assert imap_app.on_es_poll(OnESPollParams())
-    assert result().get_summary()["created"] == 19
+    assert result().get_summary()["created"] == 24
     assert result().get_summary()["failed"] == 1
     first_batch = (
         list(range(1, 11)) if manner == "oldest first" else list(range(25, 15, -1))
@@ -278,27 +276,26 @@ def test_failed_batch_replays_without_repeating_checkpointed_emails(
     )
     assert [p["rule_title"] for p in context.payloads] == [
         f"sender@example.com reported email - Reported mail {uid}"
-        for uid in first_batch + failed_batch + [failed_batch[1]] * 2
+        for uid in first_batch
+        + failed_batch
+        + [failed_batch[1]] * 2
+        + (list(range(21, 26)) if manner == "oldest first" else list(range(5, 0, -1)))
     ]
     checkpoint = context.state["ingest"]
-    assert checkpoint["es_next_muid"] == (11 if manner == "oldest first" else 26)
-    if manner == "latest first":
-        assert checkpoint["es_pending_email_uids"] == list(range(1, 16))
+    assert checkpoint["es_next_muid"] == 26
+    assert not checkpoint.get("es_pending_email_uids")
 
     context.reject_finding = None
     count = len(context.payloads)
     assert imap_app.on_es_poll(OnESPollParams())
-    remaining = (
-        list(range(11, 26)) if manner == "oldest first" else list(range(15, 0, -1))
-    )
-    assert [p["rule_title"] for p in context.payloads[count:]] == [
-        f"sender@example.com reported email - Reported mail {uid}" for uid in remaining
-    ]
+    assert context.payloads[count:] == []
     assert context.state["ingest"]["es_next_muid"] == 26
     assert not context.state["ingest"].get("es_pending_email_uids")
 
 
-def test_checkpoint_preserves_unprocessed_email_retries(poll_runtime, monkeypatch):
+def test_checkpoint_consumes_legacy_retries_even_after_es_rejection(
+    poll_runtime, monkeypatch
+):
     context = poll_runtime
     state = imap_app.app.asset.ingest_state
     state.put_all({"es_next_muid": 100, "es_failed_muid_retries": {"1": 1, "2": 1}})
@@ -307,12 +304,12 @@ def test_checkpoint_preserves_unprocessed_email_retries(poll_runtime, monkeypatc
     context.reject_finding = 2
 
     assert imap_app.on_es_poll(OnESPollParams())
-    assert state["es_next_muid"] == 100
-    assert state["es_failed_muid_retries"] == {"2": 1}
+    assert state["es_next_muid"] == 101
+    assert state["es_failed_muid_retries"] == {}
 
 
 @pytest.mark.parametrize("attempts", [0, 2])
-def test_processing_failure_is_counted_once_across_batch_checkpoints(
+def test_processing_failure_is_skipped_across_batch_checkpoints(
     poll_runtime,
     monkeypatch,
     attempts,
@@ -331,7 +328,7 @@ def test_processing_failure_is_counted_once_across_batch_checkpoints(
     monkeypatch.setattr(imap_app.app.soar_client, "MAX_BULK_FINDINGS", 1)
     assert imap_app.on_es_poll(OnESPollParams())
     assert state["es_next_muid"] == 4
-    assert state["es_failed_muid_retries"] == ({"1": 1} if attempts == 0 else {})
+    assert state["es_failed_muid_retries"] == {}
 
 
 def test_manual_poll_does_not_advance_scheduled_checkpoint(poll_runtime):
@@ -354,3 +351,74 @@ def assert_secret_free(logs):
         "test-form-secret",
     ):
         assert secret not in rendered
+
+
+@pytest.mark.parametrize("manner", ["oldest first", "latest first"])
+@pytest.mark.parametrize("bad_uid", [1, 2, 3])
+@pytest.mark.parametrize("kind", ["fetch", "parse", "build"])
+def test_individual_message_failure_advances_persisted_checkpoint(
+    poll_runtime, mocker, manner, bad_uid, kind, capsys
+):
+    context = poll_runtime
+    imap_app.app.asset.ingest_manner = manner
+    context.helper._get_email_ids_to_process.side_effect = lambda limit, lower, order: (
+        list(range(lower, 4)),
+        [],
+    )
+    private_error = "private-message-body-never-log"
+    if kind == "fetch":
+
+        def fetch(uid):
+            if uid == bad_uid:
+                raise RuntimeError(private_error)
+            return email_message(uid), None
+
+        context.helper._get_email_data.side_effect = fetch
+    else:
+        name = "extract_email_data" if kind == "parse" else "_build_finding_from_email"
+        original = getattr(imap_app, name)
+
+        def process(*args, **kwargs):
+            identifier = args[1] if kind == "parse" else args[0]
+            if identifier == str(bad_uid):
+                raise ValueError(private_error)
+            return original(*args, **kwargs)
+
+        mocker.patch.object(imap_app, name, side_effect=process)
+    assert imap_app.on_es_poll(OnESPollParams())
+    assert len(context.payloads) == 2
+    assert context.state["ingest"]["es_next_muid"] == 4
+    assert context.state["ingest"]["es_failed_muid_retries"] == {}
+    logs = capsys.readouterr().out
+    assert "Skipping ES email UID" in logs
+    assert private_error not in logs
+    imap_app.app.asset._ingest_state = AssetState(
+        imap_app.app.actions_manager, "ingest", "1", encrypted=False
+    )
+    assert imap_app.on_es_poll(OnESPollParams())
+    assert len(context.payloads) == 2
+
+
+def test_all_failed_messages_advance_checkpoint(poll_runtime):
+    context = poll_runtime
+    context.helper._get_email_ids_to_process.side_effect = lambda limit, lower, order: (
+        list(range(lower, 4)),
+        [],
+    )
+    context.helper._get_email_data.side_effect = RuntimeError("Synthetic email failure")
+    assert imap_app.on_es_poll(OnESPollParams())
+    assert context.payloads == []
+    assert context.state["ingest"]["es_next_muid"] == 4
+    assert context.state["ingest"]["es_failed_muid_retries"] == {}
+    assert imap_app.on_es_poll(OnESPollParams())
+    assert context.helper._get_email_data.call_count == 3
+
+
+def test_mailbox_listing_failure_does_not_advance_checkpoint(poll_runtime):
+    context = poll_runtime
+    context.helper._get_email_ids_to_process.side_effect = RuntimeError(
+        "Synthetic listing failure"
+    )
+    before = imap_app.app.asset.ingest_state.get_all()
+    assert not imap_app.on_es_poll(OnESPollParams())
+    assert imap_app.app.asset.ingest_state.get_all() == before
