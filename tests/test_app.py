@@ -417,3 +417,48 @@ def test_build_vault_artifact_adds_hashes(tmp_path):
     )
     assert artifact.cef["vaultId"] == "vault-id"
     assert artifact.cef["fileHashSha256"] == "sha256-value"
+
+
+@pytest.mark.parametrize(
+    "failure", ["login_error", "login_rejected", "mailbox_error", "mailbox_rejected"]
+)
+def test_es_poll_setup_errors_have_safe_authentication_or_mailbox_code(mocker, failure):
+    private = "private-password private-user private-mailbox private-server-response"
+    connection = MagicMock()
+    connection.login.return_value = ("OK", [])
+    connection.list.return_value = ("OK", [])
+    connection.select.return_value = ("OK", [])
+    reason = "authentication" if failure.startswith("login") else "mailbox"
+    operation = connection.login if reason == "authentication" else connection.select
+    if failure.endswith("error"):
+        operation.side_effect = imap_app.imaplib.IMAP4.error(private)
+    else:
+        operation.return_value = ("NO", [private.encode()])
+    mocker.patch.object(imap_app.imaplib, "IMAP4_SSL", return_value=connection)
+    helper = imap_app.ImapHelper(MagicMock(), _asset(use_ssl=True))
+
+    with pytest.raises(imap_app._ImapPollError) as caught:
+        helper._connect_to_server(for_es_poll=True)
+
+    assert caught.value.polling_error_code == reason
+    assert private not in str(caught.value)
+    assert ("credentials" if reason == "authentication" else "mailbox") in str(
+        caught.value
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("network timeout"),
+        imap_app.imaplib.IMAP4.abort("connection closed"),
+    ],
+)
+def test_es_poll_network_failure_is_not_reported_as_bad_credentials(mocker, error):
+    connection = MagicMock()
+    connection.login.side_effect = error
+    mocker.patch.object(imap_app.imaplib, "IMAP4_SSL", return_value=connection)
+    helper = imap_app.ImapHelper(MagicMock(), _asset(use_ssl=True))
+    with pytest.raises(Exception, match="Error logging") as caught:
+        helper._connect_to_server(for_es_poll=True)
+    assert not hasattr(caught.value, "polling_error_code")

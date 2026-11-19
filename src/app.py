@@ -89,6 +89,18 @@ IMAP_APP_ID = "69a0cc22-227b-4ecf-bf9d-443cabe870a0"
 logger = getLogger()
 
 
+class _ImapPollError(Exception):
+    """Identify setup failures without retaining server responses or secrets."""
+
+    def __init__(self, code: str) -> None:
+        self.polling_error_code = code
+        message = {
+            "authentication": "IMAP authentication failed. Check asset credentials and authorization.",
+            "mailbox": "IMAP mailbox selection failed. Check the configured mailbox and access permissions.",
+        }[code]
+        super().__init__(message)
+
+
 class _EmailParserLogFilter(Filter):
     """Keep released SDK parser debug events without echoing message data."""
 
@@ -1073,22 +1085,31 @@ class ImapHelper:
         )
         return self._oauth_client
 
-    def _get_oauth_access_token(self) -> str:
+    def _get_oauth_access_token(self, for_es_poll=False) -> str:
         """Get a valid OAuth access token, refreshing if necessary."""
         oauth_client = self._get_oauth_client()
         try:
             token = oauth_client.get_valid_token(auto_refresh=True)
             return token.access_token
         except AuthorizationRequiredError:
+            if for_es_poll:
+                raise _ImapPollError("authentication") from None
             raise Exception(
                 "OAuth authorization required. Please complete the OAuth flow "
                 "in the asset configuration."
             ) from None
         except TokenRefreshError as e:
+            if for_es_poll:
+                raise _ImapPollError("authentication") from None
             raise Exception(f"OAuth token refresh failed: {e}") from None
 
     def _connect_to_server(
-        self, first_try=True, access_token=None, timeout=60, read_only=True
+        self,
+        first_try=True,
+        access_token=None,
+        timeout=60,
+        read_only=True,
+        for_es_poll=False,
     ):
         """Connect to the IMAP server"""
         is_oauth = self.asset.auth_type == "OAuth"
@@ -1114,7 +1135,7 @@ class ImapHelper:
         try:
             if is_oauth:
                 if access_token is None:
-                    access_token = self._get_oauth_access_token()
+                    access_token = self._get_oauth_access_token(for_es_poll=for_es_poll)
                 auth_string = self._generate_oauth_string(
                     self.asset.username,
                     access_token,
@@ -1126,7 +1147,11 @@ class ImapHelper:
                 result, _ = self._imap_conn.login(
                     self.asset.username, self.asset.password
                 )
+        except _ImapPollError:
+            raise
         except AuthorizationRequiredError:
+            if for_es_poll:
+                raise _ImapPollError("authentication") from None
             raise
         except Exception as e:
             if first_try and is_oauth and "Invalid credentials" in str(e):
@@ -1139,17 +1164,26 @@ class ImapHelper:
                             first_try=False,
                             timeout=timeout,
                             read_only=read_only,
+                            for_es_poll=for_es_poll,
                         )
                 except Exception as refresh_error:
                     logger.error(
                         "OAuth token refresh failed: %s",
                         _email_failure_reason(refresh_error),
                     )
+            if (
+                for_es_poll
+                and isinstance(e, imaplib.IMAP4.error)
+                and not isinstance(e, imaplib.IMAP4.abort)
+            ):
+                raise _ImapPollError("authentication") from None
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(IMAP_ERROR_LOGGING_IN_TO_SERVER, e)
             ) from None
 
         if result != "OK":
+            if for_es_poll:
+                raise _ImapPollError("authentication")
             raise Exception(IMAP_ERROR_LOGGING_IN_TO_SERVER)
 
         logger.info(IMAP_LOGGED_IN)
@@ -1169,6 +1203,12 @@ class ImapHelper:
                 _quote_mailbox(self._folder_name), read_only
             )
         except Exception as e:
+            if (
+                for_es_poll
+                and isinstance(e, imaplib.IMAP4.error)
+                and not isinstance(e, imaplib.IMAP4.abort)
+            ):
+                raise _ImapPollError("mailbox") from None
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(
                     IMAP_ERROR_SELECTING_FOLDER.format(folder=self._folder_name), e
@@ -1176,6 +1216,8 @@ class ImapHelper:
             ) from e
 
         if result != "OK":
+            if for_es_poll:
+                raise _ImapPollError("mailbox")
             raise Exception(
                 IMAP_ERROR_SELECTING_FOLDER.format(folder=self._folder_name)
             )
@@ -1490,7 +1532,7 @@ def on_es_poll(
 ) -> Generator[Finding, int | None]:
     """Poll for new emails and create ES findings for each email."""
     helper = ImapHelper(soar, asset)
-    helper._connect_to_server()
+    helper._connect_to_server(for_es_poll=True)
 
     state = asset.ingest_state
     is_poll_now = params.is_manual_poll()
