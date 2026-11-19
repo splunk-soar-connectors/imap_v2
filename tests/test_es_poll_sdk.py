@@ -28,6 +28,7 @@ from soar_sdk.models.attachment_upload import AttachmentUploadResult
 from soar_sdk.params import OnESPollParams
 
 from src import app as imap_app
+from src.app import ImapHelper
 
 
 ES_URL = "https://es.example:8089"
@@ -422,3 +423,32 @@ def test_mailbox_listing_failure_does_not_advance_checkpoint(poll_runtime):
     before = imap_app.app.asset.ingest_state.get_all()
     assert not imap_app.on_es_poll(OnESPollParams())
     assert imap_app.app.asset.ingest_state.get_all() == before
+
+
+@pytest.mark.parametrize(
+    "failure, reason", [("credentials", "authentication"), ("mailbox", "mailbox")]
+)
+def test_setup_failure_preserves_safe_reason_in_sdk_result(
+    poll_runtime, mocker, failure, reason, caplog, capsys
+):
+    private = "private-password private-mailbox private-server-response"
+    mocker.patch.object(imap_app, "ImapHelper", ImapHelper)
+    imap_app.app._asset.use_ssl = True
+    connection = mocker.Mock()
+    connection.login.return_value = ("OK", [])
+    connection.list.return_value = ("OK", [])
+    connection.select.return_value = ("OK", [])
+    if failure == "credentials":
+        connection.login.side_effect = imap_app.imaplib.IMAP4.error(private)
+    else:
+        connection.select.return_value = ("NO", [private.encode()])
+    mocker.patch.object(imap_app.imaplib, "IMAP4_SSL", return_value=connection)
+    assert not imap_app.on_es_poll(OnESPollParams(container_count=1))
+    output = result()
+    summary = output.get_summary()
+    assert summary["created"] == summary["failed"] == 0
+    assert summary["polling_failed"] is True
+    assert summary["polling_errors"][0]["reason"] == reason
+    assert f"reason={reason}" in output.get_message()
+    assert private not in repr(vars(output)) + caplog.text + capsys.readouterr().out
+    assert not poll_runtime.payloads
