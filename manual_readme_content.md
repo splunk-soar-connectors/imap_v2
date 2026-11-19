@@ -277,7 +277,7 @@ Below are the ports used by IMAP library for the connection.
 
 ## ES Polling Setup Diagnostics
 
-With Splunk SOAR SDK 7.2.4 or newer, rejected IMAP credentials or OAuth
+With Splunk SOAR SDK 7.3.0 or newer, rejected IMAP credentials or OAuth
 authorization report `reason=authentication`; mailbox selection failures report
 `reason=mailbox`. Responses, credentials, and mailbox names are omitted.
 Network failures are not labeled as bad credentials. Classic polling is unchanged.

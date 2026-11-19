@@ -46,6 +46,7 @@ from soar_sdk.auth.client import (
 )
 from soar_sdk.auth.models import OAuthConfig
 from soar_sdk.exceptions import ActionFailure
+from soar_sdk.exceptions import PollingError
 from soar_sdk.extras.email import EmailProcessor, ProcessEmailContext
 from soar_sdk.extras.email.email_data import EmailData, extract_email_data
 from soar_sdk.extras.email.utils import decode_uni_string, get_file_contains
@@ -87,18 +88,6 @@ from .imap_consts import (
 IMAP_APP_ID = "69a0cc22-227b-4ecf-bf9d-443cabe870a0"
 
 logger = getLogger()
-
-
-class _ImapPollError(Exception):
-    """Identify setup failures without retaining server responses or secrets."""
-
-    def __init__(self, code: str) -> None:
-        self.polling_error_code = code
-        message = {
-            "authentication": "IMAP authentication failed. Check asset credentials and authorization.",
-            "mailbox": "IMAP mailbox selection failed. Check the configured mailbox and access permissions.",
-        }[code]
-        super().__init__(message)
 
 
 class _EmailParserLogFilter(Filter):
@@ -1093,14 +1082,14 @@ class ImapHelper:
             return token.access_token
         except AuthorizationRequiredError:
             if for_es_poll:
-                raise _ImapPollError("authentication") from None
+                raise PollingError("authentication") from None
             raise Exception(
                 "OAuth authorization required. Please complete the OAuth flow "
                 "in the asset configuration."
             ) from None
         except TokenRefreshError as e:
             if for_es_poll:
-                raise _ImapPollError("authentication") from None
+                raise PollingError("authentication") from None
             raise Exception(f"OAuth token refresh failed: {e}") from None
 
     def _connect_to_server(
@@ -1147,11 +1136,11 @@ class ImapHelper:
                 result, _ = self._imap_conn.login(
                     self.asset.username, self.asset.password
                 )
-        except _ImapPollError:
+        except PollingError:
             raise
         except AuthorizationRequiredError:
             if for_es_poll:
-                raise _ImapPollError("authentication") from None
+                raise PollingError("authentication") from None
             raise
         except Exception as e:
             if first_try and is_oauth and "Invalid credentials" in str(e):
@@ -1176,14 +1165,14 @@ class ImapHelper:
                 and isinstance(e, imaplib.IMAP4.error)
                 and not isinstance(e, imaplib.IMAP4.abort)
             ):
-                raise _ImapPollError("authentication") from None
+                raise PollingError("authentication") from None
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(IMAP_ERROR_LOGGING_IN_TO_SERVER, e)
             ) from None
 
         if result != "OK":
             if for_es_poll:
-                raise _ImapPollError("authentication")
+                raise PollingError("authentication")
             raise Exception(IMAP_ERROR_LOGGING_IN_TO_SERVER)
 
         logger.info(IMAP_LOGGED_IN)
@@ -1208,7 +1197,7 @@ class ImapHelper:
                 and isinstance(e, imaplib.IMAP4.error)
                 and not isinstance(e, imaplib.IMAP4.abort)
             ):
-                raise _ImapPollError("mailbox") from None
+                raise PollingError("mailbox") from None
             raise Exception(
                 IMAP_GENERAL_ERROR_MESSAGE.format(
                     IMAP_ERROR_SELECTING_FOLDER.format(folder=self._folder_name), e
@@ -1217,7 +1206,7 @@ class ImapHelper:
 
         if result != "OK":
             if for_es_poll:
-                raise _ImapPollError("mailbox")
+                raise PollingError("mailbox")
             raise Exception(
                 IMAP_ERROR_SELECTING_FOLDER.format(folder=self._folder_name)
             )

@@ -437,7 +437,7 @@ def test_es_poll_setup_errors_have_safe_authentication_or_mailbox_code(mocker, f
     mocker.patch.object(imap_app.imaplib, "IMAP4_SSL", return_value=connection)
     helper = imap_app.ImapHelper(MagicMock(), _asset(use_ssl=True))
 
-    with pytest.raises(imap_app._ImapPollError) as caught:
+    with pytest.raises(imap_app.PollingError) as caught:
         helper._connect_to_server(for_es_poll=True)
 
     assert caught.value.polling_error_code == reason
