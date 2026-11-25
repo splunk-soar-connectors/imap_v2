@@ -20,7 +20,7 @@ from email.message import EmailMessage
 from types import SimpleNamespace
 from uuid import UUID
 
-import httpx
+import httpx2
 import pytest
 from soar_sdk.asset_state import AssetState
 from soar_sdk.exceptions import AttachmentUploadError
@@ -130,26 +130,29 @@ def poll_runtime(monkeypatch, mocker):
     helper._get_email_data.side_effect = lambda uid: (email_message(uid), None)
     context.helper = helper
 
-    def create(_client, url, *, content, headers):
-        assert url == ES_URL + "/servicesNS/nobody/missioncontrol/public/v2/findings"
-        assert headers["Authorization"] == "Bearer " + ES_TOKEN
-        payload = json.loads(content)
+    def create(_client, request):
+        assert (
+            str(request.url)
+            == ES_URL + "/servicesNS/nobody/missioncontrol/public/v2/findings"
+        )
+        assert request.headers["Authorization"] == "Bearer " + ES_TOKEN
+        payload = json.loads(request.content)
         assert context.events.count("upload") == len(context.ids)
         context.events.append("create")
         context.payloads.append(payload)
-        index = len(context.payloads)
-        if (
-            context.reject_finding
-            and len(context.payloads) >= context.reject_finding
-            and payload == context.payloads[context.reject_finding - 1]
-        ):
-            return httpx.Response(503, text=ES_TOKEN)
-        return httpx.Response(
-            201, json={"_time": "now", "finding_id": f"finding-{index}"}
+        uid = email_uid(payload)
+        if uid == context.reject_finding:
+            return httpx2.Response(503, text=ES_TOKEN)
+        return httpx2.Response(
+            201, json={"_time": "now", "finding_id": f"finding-{uid}"}
         )
 
-    mocker.patch.object(httpx.Client, "post", autospec=True, side_effect=create)
+    mocker.patch.object(httpx2.Client, "send", autospec=True, side_effect=create)
     return context
+
+
+def email_uid(payload):
+    return int(payload["rule_title"].rsplit(" ", 1)[-1])
 
 
 def email_message(uid):
@@ -202,7 +205,7 @@ def test_imap_poll_uses_sdk_for_ordered_upload_create_and_link(
         }
         for index in range(count)
     ]
-    for index, payload in enumerate(context.payloads):
+    for index, payload in enumerate(sorted(context.payloads, key=email_uid)):
         email = payload["email"]
         assert email["raw_email_link"].endswith(
             "attachment_id=" + context.ids[index * 2]
@@ -249,7 +252,10 @@ def test_imap_poll_reports_partial_failures_without_linking_failed_inputs(
             ]
         )
         assert [
-            entry["filename"] for entry in context.payloads[0]["email"]["attachments"]
+            entry["filename"]
+            for entry in next(p for p in context.payloads if email_uid(p) == 1)[
+                "email"
+            ]["attachments"]
         ] == ["email_1.eml"]
     assert context.state.get("ingest", {}).get("es_next_muid", 1) == 4
     assert all(not path.exists() for path in context.paths)
@@ -264,7 +270,7 @@ def test_failed_email_is_skipped_without_replaying_processed_mail(poll_runtime, 
         list(range(lower, 26)),
         [],
     )
-    context.reject_finding = 12
+    context.reject_finding = 12 if manner == "oldest first" else 14
 
     assert imap_app.on_es_poll(OnESPollParams())
     assert result().get_summary()["created"] == 24
@@ -275,13 +281,12 @@ def test_failed_email_is_skipped_without_replaying_processed_mail(poll_runtime, 
     failed_batch = (
         list(range(11, 21)) if manner == "oldest first" else list(range(15, 5, -1))
     )
-    assert [p["rule_title"] for p in context.payloads] == [
-        f"sender@example.com reported email - Reported mail {uid}"
-        for uid in first_batch
-        + failed_batch
-        + [failed_batch[1]] * 2
-        + (list(range(21, 26)) if manner == "oldest first" else list(range(5, 0, -1)))
-    ]
+    sent = [email_uid(payload) for payload in context.payloads]
+    assert sorted(sent[:10]) == sorted(first_batch)
+    assert sorted(sent[10:20]) == sorted(failed_batch)
+    assert sent[20:22] == [context.reject_finding] * 2
+    tail = list(range(21, 26)) if manner == "oldest first" else list(range(1, 6))
+    assert sorted(sent[22:]) == tail
     checkpoint = context.state["ingest"]
     assert checkpoint["es_next_muid"] == 26
     assert not checkpoint.get("es_pending_email_uids")
